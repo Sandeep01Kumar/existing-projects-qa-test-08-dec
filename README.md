@@ -1,17 +1,20 @@
-# Hello World - Node.js Express Server
+# hao-backprop-test
 
-A simple Node.js HTTP server built with Express.js framework providing two endpoints.
+A simple Node.js Hello World server built with Express.js framework.
 
 ## Description
 
-This is a tutorial-level project demonstrating Express.js server implementation with multiple routes.
+This project demonstrates a basic HTTP server using Express.js with multiple endpoints. Originally created for backprop integration testing.
 
 ## Prerequisites
 
-- Node.js v18 or higher (recommended: v20.x)
-- npm package manager
+- Node.js (v18 or higher)
+- npm (Node Package Manager)
 
 ## Installation
+
+1. Clone the repository
+2. Install dependencies:
 
 ```bash
 npm install
@@ -25,41 +28,28 @@ Start the server:
 npm start
 ```
 
-Or directly:
-
-```bash
-node server.js
-```
-
-The server will start at `http://127.0.0.1:3000/`
+The server will run at `http://127.0.0.1:3000/`
 
 ## API Endpoints
 
-### GET /
+| Endpoint | Method | Response |
+|----------|--------|----------|
+| `/` | GET | Returns "Hello, World!" |
+| `/evening` | GET | Returns "Good evening" |
 
-Returns a "Hello, World!" greeting message.
+### Examples
 
-**Response:**
-- Status: 200 OK
-- Content-Type: text/plain
-- Body: `Hello, World!`
+**Hello World Endpoint:**
+```bash
+curl http://127.0.0.1:3000/
+```
+Response: `Hello, World!`
 
-### GET /evening
-
-Returns a "Good evening" greeting message.
-
-**Response:**
-- Status: 200 OK
-- Content-Type: text/plain
-- Body: `Good evening`
-
-## Dependencies
-
-- [Express.js](https://expressjs.com/) v5.2.1 - Web application framework
-
-## Author
-
-hxu
+**Good Evening Endpoint:**
+```bash
+curl http://127.0.0.1:3000/evening
+```
+Response: `Good evening`
 
 ## License
 
