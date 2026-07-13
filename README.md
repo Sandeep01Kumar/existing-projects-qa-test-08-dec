@@ -13,7 +13,13 @@ This project demonstrates a basic HTTP server using Express.js with multiple end
 
 ## Installation
 
-1. Clone the repository
+1. Clone the repository:
+
+```bash
+git clone https://github.com/Sandeep01Kumar/existing-projects-qa-test-08-dec.git
+cd existing-projects-qa-test-08-dec
+```
+
 2. Install dependencies:
 
 ```bash
