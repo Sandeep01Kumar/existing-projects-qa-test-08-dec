@@ -44,9 +44,13 @@ app.get('/evening', (req, res) => {
 
 /**
  * Start the Express server
- * Binds and listens for connections on the specified port.
+ * Binds and listens for connections on the specified port, restricted to the
+ * 127.0.0.1 loopback interface. The explicit host argument preserves the
+ * original server's loopback-only network surface (AAP IR-4) and must not be
+ * removed: omitting it makes Express bind all interfaces (the IPv6 wildcard
+ * "::"), which would expose the service beyond the loopback boundary.
  * The server will be accessible at http://127.0.0.1:3000/
  */
-app.listen(port, () => {
+app.listen(port, '127.0.0.1', () => {
   console.log(`Server running at http://127.0.0.1:${port}/`);
 });
