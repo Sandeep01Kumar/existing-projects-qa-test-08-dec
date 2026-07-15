@@ -7,7 +7,9 @@
  * - GET / : Returns "Hello, World!\n" (original functionality preserved)
  * - GET /evening : Returns "Good evening" (new endpoint)
  * 
- * The server listens on port 3000 by default, bound to host 127.0.0.1 (loopback).
+ * The server listens on port 3000 by default. The host argument is omitted from the
+ * app.listen() call, so binding is not restricted to a specific interface; 127.0.0.1
+ * appears only in the local URL printed by the startup log.
  * 
  * @module server
  * @requires express - Web application framework for HTTP server and routing
@@ -57,10 +59,11 @@ app.get('/evening', (req, res) => {
 
 /**
  * Start the Express server
- * Binds and listens for connections on the specified port.
- * The server will be accessible at http://127.0.0.1:3000/
+ * Binds and listens for connections on the specified port (3000). No host argument
+ * is passed to app.listen(), so the server is not explicitly bound to a specific
+ * interface. The URL http://127.0.0.1:3000/ shown below is only the local address
+ * printed by the startup log, not an enforced bind host.
  *
- * @listens 127.0.0.1:3000
  * @returns {void}
  */
 app.listen(port, () => {
