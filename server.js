@@ -64,6 +64,7 @@ app.get('/evening', (req, res) => {
  * interface. The URL http://127.0.0.1:3000/ shown below is only the local address
  * printed by the startup log, not an enforced bind host.
  *
+ * @listens listening - The server's 'listening' event, emitted once it is bound to port 3000.
  * @returns {void}
  */
 app.listen(port, () => {

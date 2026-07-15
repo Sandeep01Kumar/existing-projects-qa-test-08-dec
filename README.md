@@ -42,7 +42,7 @@ connections on port `3000`. Source: `server.js`.
 graph LR
     Client["HTTP Client (local URL http://127.0.0.1:3000/)"]
     subgraph app["server.js - Express application"]
-        Listener["Express app listening on port 3000 (server.js L60-L71)"]
+        Listener["Express app listening on port 3000 (server.js L60-L72)"]
         Root["GET / handler (server.js L32-L44)"]
         Evening["GET /evening handler (server.js L46-L58)"]
         Listener -->|routes GET /| Root
@@ -81,12 +81,12 @@ either value below requires editing the source file. Source: `server.js`.
 | Setting | Value | Defined in | Notes |
 |---------|-------|-----------|-------|
 | Port | `3000` | `const port = 3000;` — `server.js` L26-L30 | Hardcoded; passed to `app.listen(port, ...)`. Changing it requires editing `server.js`. |
-| Host | `127.0.0.1` | `app.listen()` startup log — `server.js` L60-L71 | Loopback address printed in the startup log (`Server running at http://127.0.0.1:3000/`) and used to reach the server locally. |
+| Host | `127.0.0.1` | `app.listen()` startup log — `server.js` L60-L72 | Loopback address printed in the startup log (`Server running at http://127.0.0.1:3000/`) and used to reach the server locally. |
 
 > **Note on host binding:** `app.listen(port, callback)` is called **without an explicit
 > host argument**, so the server is not restricted to a single named interface. `127.0.0.1`
 > is the local (loopback) address shown in the startup-log URL and is where the endpoints
-> are reachable during local use. Source: `server.js` L60-L71.
+> are reachable during local use. Source: `server.js` L60-L72.
 
 ## Running the Server
 
@@ -103,13 +103,16 @@ the process prints:
 Server running at http://127.0.0.1:3000/
 ```
 
-The server is then reachable at `http://127.0.0.1:3000/`. Source: `server.js` L60-L71.
+The server is then reachable at `http://127.0.0.1:3000/`. Source: `server.js` L60-L72.
 
 ## API Documentation
 
-The server exposes two plain-text `GET` endpoints. Any other route returns Express's
-default `404 Not Found` response. Every response includes the `X-Powered-By: Express`
-header. Source: `server.js`.
+The server exposes two plain-text `GET` endpoints, `/` and `/evening`. Express's default
+routing is **case-insensitive** and **non-strict about trailing slashes**, so each route also
+matches case and trailing-slash variants of its path — for example, `/evening`, `/evening/`,
+`/EVENING`, and `/Evening` all match the `/evening` route and return `200 OK`. Only a genuinely
+unmatched path (for example, `/unknown`) falls through to Express's default `404 Not Found`
+response. Every response includes the `X-Powered-By: Express` header. Source: `server.js`.
 
 | Method | Path | Status | Content-Type | Body |
 |--------|------|--------|--------------|------|
@@ -265,7 +268,7 @@ Keep-Alive: timeout=5
 
 ## Code Explanation
 
-The entire application is contained in `server.js` (71 lines). The walkthrough below follows
+The entire application is contained in `server.js` (72 lines). The walkthrough below follows
 the file from top to bottom. Source: `server.js`.
 
 1. **Module header (JSDoc)** — `server.js` L1-L16: a `@fileoverview` / `@module` block
@@ -283,9 +286,11 @@ the file from top to bottom. Source: `server.js`.
    response.
 6. **`GET /evening` handler** — `server.js` L46-L58: registers the `/evening` route; the
    callback replies with `res.type('text/plain').send('Good evening')`.
-7. **Start the listener** — `server.js` L60-L71: `app.listen(port, () => { ... })` binds the
-   server to port `3000` and logs `Server running at http://127.0.0.1:3000/` once it is
-   ready to accept connections.
+7. **Start the listener** — `server.js` L60-L72: `app.listen(port, () => { ... })` asks Express
+   to listen on port `3000`, and the callback logs `Server running at http://127.0.0.1:3000/`.
+   The callback does not inspect bind errors, so this log line only indicates that the listen
+   callback ran — it is not proof that this process exclusively owns port `3000` (see
+   [Troubleshooting](#troubleshooting) for platform-dependent port-conflict behavior).
 
 ## Deployment
 
@@ -295,7 +300,9 @@ This is a single-file Node.js/Express service intended to run as one foreground 
 2. **Start the process:** `npm start` (equivalently `node server.js`).
    Source: `package.json` → `scripts.start`.
 3. The process runs in the foreground and listens on port `3000`; it prints
-   `Server running at http://127.0.0.1:3000/` on startup. Source: `server.js` L60-L71.
+   `Server running at http://127.0.0.1:3000/` on startup. This log line is informational only
+   and does not by itself prove the process acquired the port — always confirm real readiness
+   with the verification step below (step 4) rather than the log alone. Source: `server.js` L60-L72.
 4. **Verify it is running** by exercising the endpoints:
 
    ```bash
@@ -323,20 +330,30 @@ Only the following application-relevant files make up this project:
 | `README.md` | This project guide. |
 
 > **Naming note (known inconsistency):** the `package.json` `name` field is `hello_world`,
-> whereas the repository/README is named `hao-backprop-test`. This mismatch is intentional
-> and left unresolved. Source: `package.json`, `README.md`.
+> while this README's title (the project title) is `hao-backprop-test`. This is a known
+> inconsistency between the project/README title and the package name; it is documented here
+> (not resolved) to avoid an unexpected rename. Source: `package.json`, `README.md`.
 
 ## Troubleshooting
 
 - **Port `3000` already in use (`EADDRINUSE`):** another process is bound to port `3000`.
   Stop that process, or change the `port` constant in `server.js` (L26-L30) and restart.
+  Because the `app.listen()` callback does not handle bind errors, the behavior of a second
+  instance started while port `3000` is held is **platform-dependent**: on Linux/Unix the
+  second process typically fails with `EADDRINUSE`, whereas on Windows it may print the same
+  `Server running at http://127.0.0.1:3000/` line and exit without surfacing an `EADDRINUSE`
+  error, even though it never acquired the port. Confirm which process actually owns the port
+  with `curl -i http://127.0.0.1:3000/` or `netstat` rather than trusting the startup log.
   Source: `server.js`.
 - **Node.js version too old:** `express` requires Node.js `>= 18`. Check with
   `node --version` and upgrade if necessary. Source: `package-lock.json`.
 - **`Cannot find module 'express'` / missing dependencies:** run `npm install` to install
   dependencies before starting the server. Source: `package.json`.
-- **`404 Not Found` responses:** only `/` and `/evening` are defined; any other path returns
-  Express's default `404`. Source: `server.js`.
+- **`404 Not Found` responses:** only `/` and `/evening` are defined. Because Express's default
+  routing is case-insensitive and non-strict about trailing slashes, path variants such as
+  `/evening/`, `/EVENING`, and `/Evening` also match the `/evening` route and return `200 OK`;
+  only a genuinely unmatched path (for example, `/unknown`) returns Express's default `404`.
+  Source: `server.js`.
 
 ## License
 
