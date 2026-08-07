@@ -51,7 +51,20 @@ app.get('/evening', (req, res) => { // Register the second GET route this featur
  * http.Server#listen while still treating the final argument as the callback.
  * The server will be accessible at http://127.0.0.1:3000/ and, because the
  * socket is bound to the loopback address, nowhere else.
+ *
+ * Express installs the callback given here as the listening socket's 'error'
+ * handler as well as its ready notification, so a bind failure such as
+ * EADDRINUSE is handed to this callback as an Error instead of being thrown.
+ * The callback therefore inspects that argument before anything else: readiness
+ * is announced only once the socket is genuinely bound, and a failed bind is
+ * reported on stderr with a non-zero exit status rather than a success line the
+ * server cannot honour.
  */
-app.listen(port, host, () => { // Bind the listening socket to the loopback host and port, keeping the callback last as Express requires, then run it once the socket is bound
+app.listen(port, host, (error) => { // Bind the listening socket to the loopback host and port, keeping the callback last as Express requires; Express also installs this callback as the socket's error handler, so it receives any bind failure here
+  if (error) { // A bind failure such as EADDRINUSE arrives as an Error, and in that case nothing is listening, so readiness must not be reported
+    console.error(`Failed to start server at http://${host}:${port}/: ${error.message}`); // Report the real cause on stderr, leaving stdout free of the readiness line that operators and automated checks treat as the startup signal
+    process.exitCode = 1; // Exit non-zero so callers, npm scripts and automation see a failed start instead of a silent success
+    return; // Stop here so the readiness log below can never follow a bind that did not succeed
+  } // Close the failure branch; everything below it runs only when the socket is genuinely bound
   console.log(`Server running at http://${host}:${port}/`); // Announce readiness on stdout with the exact address the server is reachable at; automated checks match this exact line as their startup signal
 }); // Close the listen call; the process now stays alive serving requests

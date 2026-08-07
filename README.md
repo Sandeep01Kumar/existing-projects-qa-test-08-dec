@@ -8,8 +8,10 @@ This project demonstrates a basic HTTP server using Express.js with multiple end
 
 ## Prerequisites
 
-- Node.js `^20.20.2 || >=22.12.0` (20.20.2 or later on the 20.x line, or 22.12.0 or later) - enforced by the `engines` field in `package.json` and pinned for version managers in `.nvmrc`
-- npm 10 or higher (`>=10.0.0`)
+- Node.js 20.20.2 or higher (`>=20.20.2`) - declared in the `engines` field of `package.json`, and pinned for version managers by `.nvmrc`, which selects `20.20.2`
+- npm 10 or higher (`>=10.0.0`) - declared in the same `engines` field
+
+npm checks `engines` on every install: a runtime outside the declared range is reported as an `npm warn EBADENGINE` line naming both the required and the current version, and the install is refused outright when `engine-strict` is enabled. This project ships no `.npmrc`, so an unsupported runtime warns rather than blocks.
 
 ## Installation
 
@@ -30,39 +32,39 @@ npm start
 
 The server will run at `http://127.0.0.1:3000/`
 
-The listening socket is bound to the loopback interface (`127.0.0.1`) only, so
-the server answers requests from this machine and from nowhere else - a
-request sent to any of the machine's other addresses is refused. That is
-deliberate: loopback-only binding keeps network exposure to a minimum. The
-host and port are hardcoded constants in `server.js`.
+It binds only to the loopback interface (`127.0.0.1`), so it is reachable from this machine and is not reachable from other hosts. On startup the server logs exactly:
+
+```text
+Server running at http://127.0.0.1:3000/
+```
+
+Loopback-only binding is deliberate: it keeps network exposure to a minimum. The host and port are hardcoded constants in `server.js`.
 
 ## Testing
 
-Run the test suite:
+Run the endpoint verification suite:
 
 ```bash
 npm test
 ```
 
-The suite lives in `tests/server.test.js` and runs on Node's built-in test
-runner (`node --test`), so it needs no additional dependencies - this project
-declares no `devDependencies` and `express` remains its only dependency. It
-starts the server as a child process and drives it over real HTTP, checking
-both endpoint contracts below, the absence of the framework's `X-Powered-By`
-header, and the 404 fallback. It reports 4 passing tests and 0 failures.
+This runs `node --test tests/`, which uses Node's built-in test runner: no additional test dependencies are installed or needed, and the project declares no `devDependencies`. The suite is a single file, `tests/server.test.js`. It launches `server.js` as a child process, waits for the startup line shown above, then exercises the running server over real HTTP and checks that:
+
+- `GET /` answers 200 with `text/plain; charset=utf-8` and a body of exactly 14 bytes
+- `GET /evening` answers 200 with `text/plain; charset=utf-8` and a body of exactly 12 bytes, with no trailing newline
+- neither response carries an `X-Powered-By` header
+- an unregistered path answers 404
+
+Port 3000 must be free before you run the suite, because the server binds that port directly; a process already holding it makes the run fail with an explanatory message instead of hanging. A complete run reports `# pass 4` and `# fail 0` - one result per check above - and `npm test` exits non-zero if any of those contracts drifts.
 
 ## API Endpoints
 
-| Endpoint | Method | Response |
-|----------|--------|----------|
-| `/` | GET | `Hello, World!\n` - 14 bytes, trailing newline included |
-| `/evening` | GET | `Good evening` - 12 bytes, no trailing newline |
+| Endpoint | Method | Status | Content Type | Response |
+|----------|--------|--------|--------------|----------|
+| `/` | GET | 200 | `text/plain; charset=utf-8` | `Hello, World!\n` - 14 bytes, ending in one trailing newline byte |
+| `/evening` | GET | 200 | `text/plain; charset=utf-8` | `Good evening` - 12 bytes, with no trailing newline |
 
-Both endpoints answer with HTTP status `200` and
-`Content-Type: text/plain; charset=utf-8`. The two bodies differ by exactly
-one byte that terminal output hides: `/` ends with a newline, `/evening` does
-not. No `X-Powered-By` header is sent, because `server.js` disables it. Any
-other path falls through to Express's default handler and returns `404`.
+In the Response column, `\n` is notation for a single newline byte (LF, `0x0A`) at the end of the body - not for the two characters `\` and `n`, which the response never contains. The trailing newline on `/` belongs to that endpoint's original contract and is preserved deliberately, while `/evening` deliberately omits it; that one-byte difference is why both lengths are stated. No `X-Powered-By` header is sent on either route, because `server.js` disables it. Any path matching neither route is handled by Express's default handler, which answers 404.
 
 ### Examples
 
@@ -70,13 +72,21 @@ other path falls through to Express's default handler and returns `404`.
 ```bash
 curl http://127.0.0.1:3000/
 ```
-Response: `Hello, World!\n` (14 bytes, trailing newline included)
+Response: HTTP 200, `Content-Type: text/plain; charset=utf-8`, body `Hello, World!\n` - 14 bytes, whose final byte is the newline the response itself sends.
 
 **Good Evening Endpoint:**
 ```bash
 curl http://127.0.0.1:3000/evening
 ```
-Response: `Good evening` (12 bytes, no trailing newline)
+Response: HTTP 200, `Content-Type: text/plain; charset=utf-8`, body `Good evening` - 12 bytes, with no trailing newline. Because the body does not end in a newline, your shell prints its next prompt on the same line; that prompt is terminal formatting, not part of the response.
+
+To see the status line and headers, or to confirm the byte counts yourself:
+
+```bash
+curl -i http://127.0.0.1:3000/
+curl -s http://127.0.0.1:3000/ | wc -c         # 14
+curl -s http://127.0.0.1:3000/evening | wc -c  # 12
+```
 
 ## License
 
