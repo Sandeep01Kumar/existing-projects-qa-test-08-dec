@@ -1,46 +1,43 @@
 /**
  * Express.js Server Implementation
- * 
- * This server provides two HTTP endpoints:
- * - GET / : Returns "Hello, World!\n" (original functionality preserved)
- * - GET /evening : Returns "Good evening" (new endpoint)
- * 
- * The server listens on port 3000 and binds to the loopback interface
- * (127.0.0.1) only, so it is reachable from this machine and is not exposed
- * on any other network interface.
- * 
+ *
+ * Serves two plain-text HTTP endpoints on 127.0.0.1:3000:
+ * - GET /        sends "Hello, World!\n" - 14 bytes, trailing newline included
+ * - GET /evening sends "Good evening" - 12 bytes, no trailing newline
+ *
+ * The listening socket is bound to the loopback address only, so the server
+ * accepts connections from this host and from no other network interface.
+ *
  * @requires express - Web application framework for HTTP server and routing
  */
 
-const express = require('express'); // Load the Express framework, the project's only runtime dependency, which supplies the HTTP server, routing and response helpers this server is built on
+const express = require('express'); // Load Express, the project's only declared direct dependency, to provide HTTP routing and response helpers
 
 const app = express(); // Create the Express application instance that owns the route table, the framework settings and the request pipeline
 app.disable('x-powered-by'); // Turn off Express's default "X-Powered-By" header so the framework is not advertised to clients
 
-const host = '127.0.0.1'; // Bind to the loopback interface only, keeping the tutorial server off the network
+const host = '127.0.0.1'; // Bind only to loopback so connections are accepted from this host, not from non-loopback interfaces
 const port = 3000; // Serve on the fixed tutorial port 3000 that the README and the startup log below advertise; configuration stays hardcoded rather than read from the environment
 
 /**
  * GET / - Hello World endpoint
- * Returns a plain text greeting message.
- * This preserves the original functionality from the http module implementation.
- * 
+ * Sends a plain-text greeting whose body is 14 bytes and ends in a newline.
+ *
  * @route GET /
- * @returns {string} "Hello, World!\n" with Content-Type: text/plain
+ * @returns {void} Sends HTTP 200 with Content-Type: text/plain; charset=utf-8 and body "Hello, World!\n".
  */
-app.get('/', (req, res) => { // Register the original greeting route on the root path, the first entry in the route table, so existing clients keep working unchanged
-  res.type('text/plain').send('Hello, World!\n'); // Set Content-Type to text/plain and send the original 14-byte greeting, trailing newline included
+app.get('/', (req, res) => { // Register GET / so root-path requests are dispatched to the greeting handler
+  res.type('text/plain').send('Hello, World!\n'); // Set Content-Type to text/plain and send the exact 14-byte greeting, trailing newline included
 }); // Close the root route handler, completing its registration on the router; the single response above completes the request
 
 /**
  * GET /evening - Good Evening endpoint
- * Returns a plain text evening greeting message.
- * This is a new endpoint added as part of the Express.js migration.
- * 
+ * Sends a plain-text evening greeting whose body is 12 bytes and has no newline.
+ *
  * @route GET /evening
- * @returns {string} "Good evening" with Content-Type: text/plain
+ * @returns {void} Sends HTTP 200 with Content-Type: text/plain; charset=utf-8 and body "Good evening".
  */
-app.get('/evening', (req, res) => { // Register the second GET route this feature adds, served at the /evening path, leaving the root route untouched
+app.get('/evening', (req, res) => { // Register GET /evening so that path is dispatched to the evening-greeting handler
   res.type('text/plain').send('Good evening'); // Set Content-Type to text/plain and send the exact 12-byte greeting, deliberately with no trailing newline
 }); // Close the /evening route handler, completing its registration on the router; the single response above completes the request
 
@@ -61,7 +58,7 @@ app.get('/evening', (req, res) => { // Register the second GET route this featur
  * server cannot honour.
  */
 app.listen(port, host, (error) => { // Bind the listening socket to the loopback host and port, keeping the callback last as Express requires; Express also installs this callback as the socket's error handler, so it receives any bind failure here
-  if (error) { // A bind failure such as EADDRINUSE arrives as an Error, and in that case nothing is listening, so readiness must not be reported
+  if (error) { // A bind error such as EADDRINUSE means this server has no listening socket, so readiness must not be reported
     console.error(`Failed to start server at http://${host}:${port}/: ${error.message}`); // Report the real cause on stderr, leaving stdout free of the readiness line that operators and automated checks treat as the startup signal
     process.exitCode = 1; // Exit non-zero so callers, npm scripts and automation see a failed start instead of a silent success
     return; // Stop here so the readiness log below can never follow a bind that did not succeed

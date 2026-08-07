@@ -1,55 +1,22 @@
 /**
  * Endpoint verification suite for the Express.js tutorial server.
  *
- * WHY THIS FILE EXISTS
- * Before this suite, `npm test` was the npm placeholder that unconditionally
- * exited non-zero, so the project's "Endpoint Verification" quality gate had no
- * executable backing at all: both endpoint contracts were asserted only in
- * README prose. Nothing proved that `GET /` still returned its original 14-byte
- * greeting, or that `GET /evening` returned exactly 12 bytes. This file turns
- * that prose into durable, repeatable verification.
+ * Both endpoint contracts are verified over real HTTP against the server as it
+ * is deployed: the suite spawns `server.js` as a child process and drives it
+ * with `fetch`, so nothing about the application is adapted for the tests. It
+ * uses Node built-ins only, which keeps express the sole entry in
+ * `npm ls --depth=0` and `package.json` free of a devDependencies block.
  *
- * WHY THERE ARE NO DEPENDENCIES
- * The project deliberately excludes third-party test frameworks (jest, mocha,
- * supertest and friends). Rather than argue around that exclusion, this suite
- * honours it literally: it uses only Node built-ins - `node:test`,
- * `node:assert/strict`, `node:child_process`, `node:path` - plus the global
- * `fetch` and `AbortController` that the runtime already provides. Installing
- * nothing keeps `npm ls --depth=0` reporting express as the sole dependency and
- * keeps `package.json` free of a devDependencies block.
- *
- * WHY IT SPAWNS THE SERVER INSTEAD OF IMPORTING IT
- * `server.js` exports nothing - it creates the Express app and immediately
- * starts listening. Adding `module.exports = app` purely to make it importable
- * would change the module's public shape and add a line to the one file whose
- * commenting is separately audited, so it is rejected. Spawning `server.js` as
- * a child process and driving it over real HTTP is strictly better anyway: it
- * exercises the deployed shape, exactly as a user does, rather than a
- * test-only variant of the application.
- *
- * WHAT IT AUTOMATES
- * The four tests below mechanise the repository's own documented manual
- * verification checklist, one for one:
- *   1. `npm start`                                -> the readiness signal below
- *   2. `curl http://127.0.0.1:3000/`              -> test 1
- *   3. `curl http://127.0.0.1:3000/evening`       -> test 2
- *   4. `curl http://127.0.0.1:3000/nonexistent`   -> test 4
- * Test 3 additionally pins the absence of the framework's advertising header,
- * which `server.js` suppresses on purpose.
- *
- * HOW IT KNOWS IT IS TESTING THE RIGHT PROCESS
  * The server binds a FIXED port, so "something answered on port 3000" is not the
- * same claim as "the code under test answered". A leftover server from an earlier
- * run, or another checkout of this same tutorial, would answer every request here
- * correctly while the child started below died of EADDRINUSE - and the suite would
- * report a green that proved nothing. Three layers rule that out: the port is
- * proven free BEFORE the child is spawned, readiness is read from that child's own
- * stdout, and every request afterwards is bracketed by a liveness check and raced
- * against the child's death. Teardown is bounded at every step for the mirror-image
- * reason: a suite that cannot stop its own server leaves the port occupied for
- * whatever runs next.
+ * same claim as "the code under test answered". Three layers close that gap: the
+ * port is proven free BEFORE the child is spawned, readiness is read from that
+ * child's own stdout by matching the exact startup line rather than sleeping,
+ * and every request afterwards is bracketed by a liveness check and raced
+ * against the child's death. Teardown is bounded at every step for the
+ * mirror-image reason: a suite that cannot stop its own server leaves the port
+ * occupied for whatever runs next.
  *
- * @requires node:test - Node's built-in test runner (no external framework)
+ * @requires node:test - Node's built-in test runner
  * @requires node:assert/strict - strict assertions, so any drift fails loudly
  * @requires node:child_process - to spawn the real server process
  * @requires node:path - to resolve server.js independently of the cwd
@@ -68,13 +35,31 @@ const path = require('node:path');
 const baseUrl = 'http://127.0.0.1:3000';
 
 /**
+ * Repository root, one level above this file. It anchors both the entrypoint
+ * resolved below and the redaction in `redactPaths`, which strips this prefix
+ * out of anything quoted in a failure message.
+ */
+const repoRoot = path.join(__dirname, '..');
+
+/**
  * Absolute path to the server entrypoint, resolved from this file's own
  * directory. It must NOT be derived from `process.cwd()`: the npm script runs
- * `node --test tests/` from the repository root, so the cwd is one level above
- * this file. Resolving from `__dirname` is correct no matter where the runner
- * is invoked.
+ * the runner from the repository root, so the cwd is one level above this file.
+ * Resolving from `__dirname` is correct no matter where the runner is invoked.
  */
-const serverPath = path.join(__dirname, '..', 'server.js');
+const serverPath = path.join(repoRoot, 'server.js');
+
+/**
+ * How the entrypoint is NAMED in diagnostics - relative to the repository root,
+ * never as the absolute path used to spawn it.
+ *
+ * Failure messages from this suite land in CI output and shared logs, and the
+ * absolute path describes the filesystem layout of whoever happened to run the
+ * suite without helping anybody fix the failure: `server.js` is exactly as
+ * actionable as a full path through somebody's home directory, and discloses
+ * nothing.
+ */
+const serverLabel = path.relative(repoRoot, serverPath);
 
 /**
  * The exact line the server logs once its listening socket is bound. Waiting
@@ -103,9 +88,9 @@ const requestTimeoutMs = 5000;
 
 /**
  * Upper bound on the pre-spawn port probe - see `requirePortIsFree`. It is
- * deliberately short: the probe talks to loopback only, where a free port
- * refuses the connection immediately, so anything slower than this already
- * means something is sitting on the port.
+ * deliberately short because on loopback a free port refuses the connection
+ * immediately: ECONNREFUSED proves the port is free; a response, timeout, or
+ * different transport error is treated conservatively as unavailable.
  */
 const preflightTimeoutMs = 2000;
 
@@ -118,6 +103,15 @@ const preflightTimeoutMs = 2000;
  * without ever waiting indefinitely for a stream that will not close.
  */
 const stdioDrainTimeoutMs = 1000;
+
+/**
+ * Upper bound on how much of the child's output a single failure message may
+ * quote. A healthy child prints one readiness line, but a crashing runtime can
+ * print a great deal, and a message that reproduces all of it buries the
+ * actionable part and copies the whole lot into whatever log collects it. The
+ * TAIL is what is kept: the end of the output is where the cause is.
+ */
+const maxQuotedOutputChars = 600;
 
 /**
  * How long the child is given to honour SIGTERM before teardown escalates to
@@ -155,10 +149,7 @@ const expectedContentType = 'text/plain; charset=utf-8';
  */
 let serverProcess = null;
 
-/** Everything the child has written to stdout, used for the readiness signal. */
 let serverStdout = '';
-
-/** Everything the child has written to stderr, kept purely for diagnostics. */
 let serverStderr = '';
 
 /**
@@ -174,7 +165,6 @@ let serverStderr = '';
  */
 let childExit = null;
 
-/** True once the child's stdio streams have closed, i.e. its output is final. */
 let childStdioClosed = false;
 
 /**
@@ -200,7 +190,6 @@ let teardownError = null;
  */
 let teardownRequested = false;
 
-/** True once the startup promise has settled, either way. */
 let startupSettled = false;
 
 /**
@@ -264,11 +253,8 @@ const settledWithin = (promise, timeoutMs) => new Promise((resolve) => {
 });
 
 /**
- * Return the child-process state to its pre-spawn condition.
- *
- * Called immediately before each spawn so that no observation from an earlier
- * attempt can leak into the next one - a stale `childExit` would make a healthy
- * child look dead, which is the sort of bug a test harness must never have.
+ * Initialize child-process state and deferreds immediately before the suite's
+ * server spawn.
  */
 const resetChildState = () => {
   serverStdout = '';
@@ -289,17 +275,16 @@ const resetChildState = () => {
  * Detach every listener this suite attached, and release any pipe still open.
  *
  * Run at the very end of teardown, when nothing is left to observe. Until that
- * point the listeners must stay: a `ChildProcess` with no `error` listener turns
- * the next error into an uncaught exception, so they are replaced by state-aware
- * handlers during the run rather than removed early.
+ * point the listeners must stay attached: a `ChildProcess` with no `error`
+ * listener turns the next error into an uncaught exception.
  *
  * The three releases matter for three different reasons. Detaching the listeners
  * stops this suite reacting to a process it no longer owns. Destroying a pipe
  * that never closed frees the handle that pipe holds. And `unref` is the one that
  * guarantees a RESULT: a live child handle keeps its parent's event loop alive,
  * so a child that refused both signals would otherwise stop the runner from ever
- * exiting - turning the loud teardown failure raised just above into the silent
- * hang this whole rewrite exists to prevent.
+ * exiting, replacing the loud teardown failure raised just above with a silent
+ * hang.
  */
 const releaseChildResources = () => {
   if (serverProcess === null || installedListeners === null) {
@@ -332,30 +317,155 @@ const releaseChildResources = () => {
 };
 
 /**
+ * Absolute prefixes worth naming rather than flattening to a placeholder, sorted
+ * longest first so a nested prefix cannot be shadowed by a shorter one that also
+ * matches.
+ *
+ * Two are worth naming and no more. `repoRoot` covers every path inside this
+ * checkout, so a file in the project keeps its project-relative name. The
+ * interpreter's own path covers the executable this suite spawns, which is
+ * exactly what a failed spawn or an undeliverable signal names. Every other
+ * absolute path is somebody's machine and is flattened by the sweep below.
+ */
+const redactedPrefixes = [
+  { prefix: repoRoot, label: '<repo>' },
+  { prefix: process.execPath, label: '<node>' }
+].sort((left, right) => right.prefix.length - left.prefix.length);
+
+/**
+ * Any remaining absolute filesystem path, i.e. one that survived the prefix pass
+ * above and therefore names something outside both the checkout and the runtime.
+ *
+ * Two guards keep it from eating things that only look like paths. It requires
+ * at least two segments, so a route such as `/evening` is untouched. And the
+ * leading slash must not follow a word character, a colon, another slash or a
+ * `>`: that spares `http://127.0.0.1:3000/` and spares the relative remainder of
+ * an already-labelled path such as `<repo>/server.js`.
+ */
+const absolutePathPattern = /(?<![\w:/>])\/(?:[\w.@+~-]+\/)+[\w.@+~-]+/g;
+
+/** A stack frame line, as printed by V8: leading whitespace, then `at `. */
+const stackFramePattern = /^\s*at\s/;
+
+/**
+ * Strip filesystem detail out of text that is about to be quoted in a failure
+ * message: label the two prefixes that are worth recognising, then reduce every
+ * other absolute path to a placeholder.
+ *
+ * The order matters. Labelling first keeps the useful part of a path inside the
+ * project - `<repo>/server.js` says which file, without saying where the
+ * checkout lives - whereas sweeping first would flatten it to a placeholder that
+ * says nothing at all.
+ *
+ * @param {string} text - raw text from the child process or the runtime
+ * @returns {string} the same text with filesystem locations redacted
+ */
+const redactPaths = (text) => redactedPrefixes
+  .reduce((carried, { prefix, label }) => carried.split(prefix).join(label), text)
+  .replace(absolutePathPattern, '<path>');
+
+/**
+ * Replace runs of stack frames with a count of what was dropped.
+ *
+ * A stack trace from the child is the noisiest and least useful thing that can
+ * appear in a failure message: it names runtime internals and absolute file
+ * locations, while the line that actually explains the failure is the error
+ * message above it. Recording how many frames were omitted keeps the shape of
+ * the failure visible - and tells the reader to run the child directly if the
+ * frames are what they need.
+ *
+ * @param {string} text - text that may contain stack frames
+ * @returns {string} the same text with each run of frames summarised
+ */
+const collapseStackFrames = (text) => {
+  const kept = [];
+  let framesSeen = 0;
+
+  const summariseRun = () => {
+    if (framesSeen > 0) {
+      kept.push(`    <${framesSeen} stack frame${framesSeen === 1 ? '' : 's'} omitted>`);
+      framesSeen = 0;
+    }
+  };
+
+  text.split('\n').forEach((line) => {
+    if (stackFramePattern.test(line)) {
+      framesSeen += 1;
+      return;
+    }
+
+    summariseRun();
+    kept.push(line);
+  });
+
+  summariseRun();
+
+  return kept.join('\n');
+};
+
+/**
+ * Redact a single message the runtime handed us. Spawn and signal failures name
+ * the executable they could not run or reach, so these messages carry absolute
+ * paths just as often as the child's own output does.
+ *
+ * @param {string} message - an Error message from the runtime
+ * @returns {string} the message with filesystem locations redacted
+ */
+const redactMessage = (message) => collapseStackFrames(redactPaths(message));
+
+/**
+ * Prepare the child's accumulated output for quoting: redact it, collapse its
+ * stack frames, keep only the last `maxQuotedOutputChars` characters, and JSON
+ * encode the result so newlines stay on one line of the report.
+ *
+ * @param {string} output - everything the child has written to one stream
+ * @returns {string} a bounded, redacted, JSON-encoded rendering
+ */
+const quoteChildOutput = (output) => {
+  const redacted = redactMessage(output);
+  const bounded = redacted.length <= maxQuotedOutputChars
+    ? redacted
+    : `[...${redacted.length - maxQuotedOutputChars} earlier characters omitted]` +
+      `${redacted.slice(-maxQuotedOutputChars)}`;
+
+  return JSON.stringify(bounded);
+};
+
+/**
  * Render what the child process has told us so far. Attached to every failure
  * message so a broken run explains itself instead of leaving the reader to
- * re-run the server by hand: a port clash, a missing express install or a
- * syntax error in server.js all show up here verbatim.
+ * re-run the server by hand: a port clash, a missing express install or a syntax
+ * error in the server file all show up here.
+ *
+ * It reports the minimum that identifies the failure and nothing that merely
+ * describes the machine it happened on. The entrypoint is named relative to the
+ * repository, the runtime is named by version rather than by the absolute path
+ * of its executable, the child's process id is omitted because no reader can act
+ * on it - an unstoppable child is reported by teardown in its own words - and
+ * everything quoted from the child is redacted, stripped of stack frames and
+ * capped.
  */
 const describeChild = () => {
   const state = serverProcess === null
     ? 'never started'
-    : `pid=${serverProcess.pid} exitCode=${serverProcess.exitCode} signalCode=${serverProcess.signalCode}`;
+    : serverProcess.pid === undefined
+      ? 'spawn failed, so there is no process'
+      : `spawned, exitCode=${serverProcess.exitCode} signalCode=${serverProcess.signalCode}`;
 
   const recordedExit = childExit === null
     ? 'still running (no exit observed)'
     : `code=${childExit.code} signal=${childExit.signal}`;
 
   return [
-    `  server path : ${serverPath}`,
-    `  interpreter : ${process.execPath}`,
+    `  server file : ${serverLabel}`,
+    `  runtime     : ${process.version}`,
     `  child state : ${state}`,
     `  exit seen   : ${recordedExit}`,
     `  stdio closed: ${childStdioClosed}`,
     `  stopping    : ${teardownRequested}`,
-    `  child error : ${childError === null ? 'none' : childError.message}`,
-    `  stdout seen : ${JSON.stringify(serverStdout)}`,
-    `  stderr seen : ${JSON.stringify(serverStderr)}`
+    `  child error : ${childError === null ? 'none' : redactMessage(childError.message)}`,
+    `  stdout seen : ${quoteChildOutput(serverStdout)}`,
+    `  stderr seen : ${quoteChildOutput(serverStderr)}`
   ].join('\n');
 };
 
@@ -381,12 +491,12 @@ const createHarnessError = (message) => {
 /**
  * Put a resolved `childFailure` description into words for a failure message.
  *
- * @param {{kind: string, code?: number, signal?: string, error?: Error}} failure
+ * @param {{kind:'error', error:Error}|{kind:'exit', code:number|null, signal:string|null}} failure
  * @returns {string} a short human-readable cause
  */
 const describeFailure = (failure) => (
   failure.kind === 'error'
-    ? `the runtime reported "${failure.error.message}"`
+    ? `the runtime reported "${redactMessage(failure.error.message)}"`
     : `it exited with code ${failure.code} and signal ${failure.signal}`
 );
 
@@ -398,7 +508,8 @@ const describeFailure = (failure) => (
 const childWasSpawned = () => serverProcess !== null && serverProcess.pid !== undefined;
 
 /**
- * True once the child has exited, for any reason.
+ * True when no live spawned child remains: it was never started or it has
+ * exited.
  *
  * It consults the recorded exit as well as the handle's own fields, because the
  * two answer slightly different questions: the handle reflects what Node has
@@ -491,10 +602,8 @@ const get = async (route) => {
       );
     }
 
-    // ...and the child must still be alive AFTER it answered. A response from a
-    // process that has since vanished is the signature of a stale server holding
-    // the port while our own child exits, which is precisely the false green
-    // this bracket exists to prevent.
+    // Recheck the child after the response so the suite does not continue once
+    // its owned server has exited, even if the HTTP exchange completed.
     assertChildIsRunning(`after requesting ${route}`);
 
     return outcome.value;
@@ -507,12 +616,41 @@ const get = async (route) => {
       throw error;
     }
 
-    const reason = error instanceof Error ? error.message : String(error);
+    const reason = redactMessage(error instanceof Error ? error.message : String(error));
 
     throw createHarnessError(`GET ${route} failed: ${reason}\n${describeChild()}`);
   } finally {
     clearTimeout(timer);
   }
+};
+
+/**
+ * Release a response body without reading a single byte of it.
+ *
+ * Cancelling the stream discards whatever has already arrived and refuses the
+ * rest, so nothing is ever materialised in memory, and the connection is
+ * released rather than left half-read. That distinction is the whole point of
+ * this helper: `response.text()` would buffer the entire body, and the only
+ * response this is used on comes from an UNKNOWN process on the fixed port. A
+ * request deadline bounds how LONG such a process may stream, never how MUCH, so
+ * a local listener answering with an endless body could exhaust the test runner
+ * before the deadline ever fired.
+ *
+ * It resolves to false rather than rejecting when the stream cannot be
+ * cancelled: by that point the caller's verdict is already settled, and a body
+ * that refuses to close must not turn a definite answer into an exception.
+ *
+ * @param {Response} response - a settled fetch response
+ * @returns {Promise<boolean>} true once the body has been released
+ */
+const releaseResponseBody = (response) => {
+  const body = response.body;
+
+  if (body === null || body === undefined) {
+    return Promise.resolve(true);
+  }
+
+  return body.cancel().then(() => true, () => false);
 };
 
 /**
@@ -526,6 +664,9 @@ const get = async (route) => {
  * claimed cleanly either. Reporting what was actually seen, rather than a bare
  * boolean, is what lets the caller write a message an operator can act on.
  *
+ * The status line alone settles that question, so the body is discarded unread -
+ * see `releaseResponseBody` for why this probe must never buffer it.
+ *
  * @returns {Promise<{free: boolean, detail: string}>}
  */
 const probeFixedPort = async () => {
@@ -535,10 +676,17 @@ const probeFixedPort = async () => {
   try {
     const response = await fetch(`${baseUrl}/`, { signal: controller.signal });
 
-    // Drain the body so the connection is released rather than left half-read.
-    await response.text();
+    // Something answered, so the verdict is already decided by the status. Take
+    // it first, then throw the body away without reading it.
+    const status = response.status;
+    const released = await releaseResponseBody(response);
 
-    return { free: false, detail: `it answered with HTTP ${response.status}` };
+    return {
+      free: false,
+      detail: released
+        ? `it answered with HTTP ${status}`
+        : `it answered with HTTP ${status}, and its response body could not be released cleanly`
+    };
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
       return {
@@ -634,38 +782,28 @@ const confirmServerIsOurs = async () => {
 /**
  * Start the real server before any test runs.
  *
- * Three details are load-bearing:
+ * Four details are load-bearing:
  *
- * 1. `process.execPath` rather than the string 'node'. This guarantees the
- *    child runs the very same interpreter as the test process, so the suite
- *    exercises the intended runtime instead of whichever `node` happens to sit
- *    first on PATH.
+ * 1. `process.execPath` rather than the string 'node', so the child runs the same
+ *    interpreter as the test process, not whichever `node` sits first on PATH.
  *
- * 2. Readiness is OBSERVED, never guessed. The hook resolves when the child's
- *    accumulated stdout contains the startup log line - checked against the
- *    running accumulation rather than a single chunk, since a stream may split
- *    the line across chunks. A fixed sleep would be both slower and racy.
+ * 2. Readiness is OBSERVED, never guessed: the hook resolves when the child's
+ *    ACCUMULATED stdout contains the startup log line, since a stream may split
+ *    that line across chunks.
  *
- * 3. Failure is LOUD, never a hang. The server binds a hardcoded port, so a
- *    stale process already holding it is a realistic failure mode. Three guards
- *    cover it: an `exit` listener fails the run when the child dies (this is how
- *    EADDRINUSE surfaces - the server reports the bind error on stderr and exits
- *    non-zero), a spawn `error` listener fails it when there was never a process
- *    at all, and a bounded timer fails it if readiness simply never arrives.
- *    Every one of those messages carries whatever the child printed.
+ * 3. Failure is LOUD, never a hang. An `exit` listener fails the run when the
+ *    child dies - which is how EADDRINUSE on the hardcoded port surfaces - a
+ *    spawn `error` listener fails it when no process was ever created, and a
+ *    bounded timer fails it if readiness never arrives. Every such message
+ *    carries whatever the child printed.
  *
- * 4. The listeners installed here OUTLIVE startup, and that is deliberate. The
- *    child's `exit`, `close` and `error` events can arrive at any point in the
- *    run, so each one records what happened into shared state that the requests
- *    and the teardown hook consult afterwards. Only the readiness probe is
- *    startup-specific, and it is removed the moment startup settles. Binding
- *    every listener to a one-shot settlement instead would leave them inert
- *    afterwards: a mid-suite crash would go unnoticed and a failed kill during
- *    teardown would be swallowed.
+ * 4. The listeners installed here OUTLIVE startup, because the child's `exit`,
+ *    `close` and `error` events can arrive at any point and the requests and the
+ *    teardown hook consult what they record. Only the readiness probe is
+ *    startup-specific, and it is removed the moment startup settles.
  *
- * Note that stderr is collected for diagnostics only. Runtimes may print
- * warnings there during a perfectly healthy start, so stderr content alone is
- * never treated as an error.
+ * stderr is collected for diagnostics only: runtimes may print warnings there
+ * during a healthy start, so stderr content alone is never treated as an error.
  */
 const awaitStartupLog = () => new Promise((resolve, reject) => {
   resetChildState();
@@ -781,12 +919,11 @@ const awaitStartupLog = () => new Promise((resolve, reject) => {
 
     if (!startupSettled) {
       finish(createHarnessError(
-        `Could not spawn the server: ${error.message}\n${describeChild()}`
+        `Could not spawn the server: ${redactMessage(error.message)}\n${describeChild()}`
       ));
     }
   };
 
-  /** Startup-only: resolve as soon as the accumulated stdout carries the line. */
   const watchForReadyLog = () => {
     if (serverStdout.includes(readyLog)) {
       finish(null);
@@ -904,23 +1041,19 @@ before(async () => {
  * unbounded by default.
  */
 after(async () => {
-  // Step 1 - from this moment an exit is expected rather than a failure.
   teardownRequested = true;
 
   const problems = [];
 
   try {
-    // Step 2 - nothing to stop.
     if (!childWasSpawned() || childHasExited()) {
       return;
     }
 
-    // Step 3 - ask politely, and verify the signal landed.
     if (!serverProcess.kill('SIGTERM') && !childHasExited()) {
       problems.push('SIGTERM could not be delivered to the child process');
     }
 
-    // Step 4 - bounded grace, then force.
     if (!(await settledWithin(exitObserved.promise, gracefulStopTimeoutMs))) {
       if (!serverProcess.kill('SIGKILL') && !childHasExited()) {
         problems.push('SIGKILL could not be delivered to the child process');
@@ -944,7 +1077,9 @@ after(async () => {
     }
 
     if (teardownError !== null) {
-      problems.push(`the runtime reported "${teardownError.message}" while stopping the child`);
+      problems.push(
+        `the runtime reported "${redactMessage(teardownError.message)}" while stopping the child`
+      );
     }
   } finally {
     // No timer of ours survives this hook: `settledWithin` clears its own, and
@@ -962,21 +1097,16 @@ after(async () => {
 }, { timeout: teardownHookTimeoutMs });
 
 /**
- * Test 1 - the original greeting, preserved byte for byte.
+ * Test 1 - the root greeting, asserted byte for byte.
  *
- * Mechanises the documented manual step `curl http://127.0.0.1:3000/`.
- *
- * The trailing newline is the point of this test. It is not cosmetic: the
- * greeting predates the Express migration and the newline is part of its
- * published contract, so the response must stay exactly 14 bytes -
- * `Hello, World!` plus `\n`. Terminal output hides that byte, which is why the
- * length is asserted explicitly alongside the literal.
- *
- * The literal is also authoritative in its own right. It is deliberately NOT
- * "corrected" to a looser paraphrase such as 'Hello world': the code emitted
- * this exact string before this change set and must keep emitting it.
+ * `GET /` answers 200 with Content-Type `text/plain; charset=utf-8` and a body
+ * of exactly `Hello, World!\n` - 14 bytes, trailing newline included. That
+ * newline is part of the published contract rather than cosmetic, and terminal
+ * output hides it, so the byte length is asserted explicitly alongside the
+ * literal. The literal is authoritative: it is deliberately not relaxed to a
+ * looser paraphrase such as 'Hello world'.
  */
-test('GET / returns the original greeting byte for byte', async () => {
+test('GET / returns the greeting byte for byte', async () => {
   const response = await get('/');
 
   assert.equal(response.status, 200, 'the root route must answer 200 OK');
@@ -993,23 +1123,17 @@ test('GET / returns the original greeting byte for byte', async () => {
   );
 
   assert.equal(response.body, 'Hello, World!\n', 'the greeting must be preserved verbatim');
-
-  // Buffer is a runtime global, so counting bytes costs no dependency. This
-  // guards the trailing newline that strict string equality already covers but
-  // that a future edit could quietly drop.
   assert.equal(Buffer.byteLength(response.body), 14, 'the greeting must remain 14 bytes');
 });
 
 /**
- * Test 2 - the evening greeting, deliberately WITHOUT a trailing newline.
+ * Test 2 - the evening greeting, asserted WITHOUT a trailing newline.
  *
- * Mechanises the documented manual step `curl http://127.0.0.1:3000/evening`.
- *
- * The asymmetry with test 1 is the whole reason both tests exist: the root
- * greeting ends in a newline for backward compatibility, this one does not.
- * Twelve bytes exactly, no terminator. Asserting the absence explicitly means
- * a well-meaning "let's be consistent" edit fails the build instead of
- * silently changing a published contract.
+ * `GET /evening` answers 200 with Content-Type `text/plain; charset=utf-8` and a
+ * body of exactly `Good evening` - 12 bytes, no terminator. The asymmetry with
+ * test 1 is the whole reason both tests exist: the root greeting ends in a
+ * newline and this one does not, so the absence is asserted explicitly rather
+ * than left to the strict body comparison alone.
  */
 test('GET /evening returns the evening greeting with no trailing newline', async () => {
   const response = await get('/evening');
@@ -1034,18 +1158,13 @@ test('GET /evening returns the evening greeting with no trailing newline', async
 /**
  * Test 3 - the framework must not advertise itself.
  *
- * Express enables an `X-Powered-By` response header by default. It offers no
- * functional benefit, it names the stack to anyone who asks, and the server
- * predating the Express migration never sent it - so `server.js` turns the
- * setting off. This test is what keeps it off.
+ * Express enables an `X-Powered-By` response header by default, and `server.js`
+ * disables that setting application-wide, so neither route sends it. This test
+ * is what keeps it that way.
  *
  * Both routes are checked, because the header is written per response from an
  * application-wide setting rather than per route: if the setting were ever
  * re-enabled, every response would regain the header at once.
- *
- * Note that older project documentation lists `X-Powered-By: Express` among
- * the expected response headers. That documentation predates the header's
- * removal and is stale; absence is the current contract.
  */
 test('neither endpoint advertises the framework via x-powered-by', async () => {
   const root = await get('/');

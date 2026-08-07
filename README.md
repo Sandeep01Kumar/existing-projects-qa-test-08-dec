@@ -8,8 +8,10 @@ This project demonstrates a basic HTTP server using Express.js with multiple end
 
 ## Prerequisites
 
-- Node.js 20.20.2 or higher (`>=20.20.2`) - declared in the `engines` field of `package.json`, and pinned for version managers by `.nvmrc`, which selects `20.20.2`
+- Node.js 20.20.2 or newer on the Node 20 line (`^20.20.2`) - declared in the `engines` field of `package.json`, and pinned for version managers by `.nvmrc`, which selects `20.20.2`
 - npm 10 or higher (`>=10.0.0`) - declared in the same `engines` field
+
+`20.20.2` is the runtime this project is built and verified against, and it is the newest 20.x release. The range is written as `^20.20.2` - that is, 20.20.2 up to but not including 21.0.0 - rather than as an open `>=` bound, because `npm test` finds its suite by naming the `tests/` directory, and treating a positional argument as a directory to search is part of the Node 20 test runner's contract. Node 22 changed the same argument to mean a glob pattern, so `node --test tests/` does not locate the suite there. Bounding the range to the line the test command actually works on keeps the manifest from advertising support this project cannot honour.
 
 npm checks `engines` on every install: a runtime outside the declared range is reported as an `npm warn EBADENGINE` line naming both the required and the current version, and the install is refused outright when `engine-strict` is enabled. This project ships no `.npmrc`, so an unsupported runtime warns rather than blocks.
 
@@ -48,7 +50,7 @@ Run the endpoint verification suite:
 npm test
 ```
 
-This runs `node --test tests/`, which uses Node's built-in test runner: no additional test dependencies are installed or needed, and the project declares no `devDependencies`. The suite is a single file, `tests/server.test.js`. It launches `server.js` as a child process, waits for the startup line shown above, then exercises the running server over real HTTP and checks that:
+This runs `node --test tests/`, which uses Node's built-in test runner: no additional test dependencies are installed or needed, and the project declares no `devDependencies`. Naming the `tests/` directory lets the runner discover the suite inside it, which is the single file `tests/server.test.js`; adding another `*.test.js` file to that directory is enough to include it, with no change to the command. It launches `server.js` as a child process, waits for the startup line shown above, then exercises the running server over real HTTP and checks that:
 
 - `GET /` answers 200 with `text/plain; charset=utf-8` and a body of exactly 14 bytes
 - `GET /evening` answers 200 with `text/plain; charset=utf-8` and a body of exactly 12 bytes, with no trailing newline
