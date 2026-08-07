@@ -7,6 +7,23 @@
  * uses Node built-ins only, which keeps express the sole entry in
  * `npm ls --depth=0` and `package.json` free of a devDependencies block.
  *
+ * This file plays TWO roles, and the dispatch at the very bottom picks one:
+ *
+ *   - Run it directly - `node tests/server.test.js`, which is what `npm test`
+ *     does - and it is the suite's FRONT END. It runs the tests in a child
+ *     `node --test` process and copies that runner's report through a redaction
+ *     filter on the way out. The filter exists because the runner labels every
+ *     failure with the absolute path of this file and a full stack trace: both
+ *     describe the filesystem of whoever happened to run the suite rather than
+ *     the failure itself, and both end up in whatever log collects CI output.
+ *     So the report names this file relative to the repository and replaces
+ *     runs of stack frames with a count of what was dropped. The runner's exit
+ *     status is passed straight through: redaction changes what a failure READS
+ *     like, never whether the run failed.
+ *
+ *   - Let that runner load it - or invoke `node --test` on it by hand - and it
+ *     is the SUITE: four tests plus the hooks that own the server process.
+ *
  * The server binds a FIXED port, so "something answered on port 3000" is not the
  * same claim as "the code under test answered". Three layers close that gap: the
  * port is proven free BEFORE the child is spawned, readiness is read from that
@@ -20,14 +37,20 @@
  * bind the loopback address and nothing else, and a request to 127.0.0.1
  * succeeds identically whether the socket is bound to 127.0.0.1, to 0.0.0.0 or
  * to `::`. That contract is settled instead by dialling the addresses OUTSIDE
- * the intended binding and requiring every one of them to refuse.
+ * the intended binding and requiring every one of them to refuse - assertions
+ * that ride in the first test, whose own request is exactly the positive control
+ * they need before a refusal can mean anything.
  *
  * @requires node:test - Node's built-in test runner
  * @requires node:assert/strict - strict assertions, so any drift fails loudly
- * @requires node:child_process - to spawn the real server process
+ * @requires node:child_process - to spawn the real server process, and to run
+ *   the suite itself in a child runner when this file is the entry point
  * @requires node:path - to resolve server.js independently of the cwd
  * @requires node:net - to ask at the TCP layer which addresses accept a connection
  * @requires node:os - to enumerate this host's addresses outside the binding
+ * @requires node:stream - to pipe the child runner's report through the filter
+ * @requires node:string_decoder - to split that report into lines without ever
+ *   cutting a multi-byte character in half at a chunk boundary
  */
 
 const { test, before, after } = require('node:test');
@@ -36,6 +59,8 @@ const { spawn } = require('node:child_process');
 const path = require('node:path');
 const net = require('node:net');
 const os = require('node:os');
+const { Transform } = require('node:stream');
+const { StringDecoder } = require('node:string_decoder');
 
 /**
  * Base URL for every request. The server hardcodes host 127.0.0.1 and port
@@ -1155,269 +1180,599 @@ const awaitStartupLog = () => new Promise((resolve, reject) => {
 });
 
 /**
- * Bring the server up before any test runs, in three ordered steps whose order
- * is itself part of the guarantee: prove the port is free, start the child and
- * observe its readiness, then prove the process answering that port is the child.
+ * Register the suite: the hooks that own the server process, then the tests.
  *
- * The hook carries an explicit deadline because Node leaves hook timeouts
- * unbounded by default; it is generous enough that only a genuine stall inside
- * the hook can trip it.
+ * Registration lives inside a function because this file has two roles - see
+ * the header and the dispatch at the bottom of the file. Only the process the
+ * test runner loads may register tests; the front end must not, or the suite
+ * would be declared twice over, once in the front end and once again in the
+ * child runner it starts.
+ *
+ * FOUR top-level tests is the contract this suite is measured against, and the
+ * count is deliberate rather than incidental: `npm test` must report
+ * `# tests 4`, `# pass 4`, `# fail 0`. Anything that would add a fifth result -
+ * another `test()` call, or a `describe()` wrapper, which contributes a result
+ * of its own - breaks that contract. A new check therefore belongs INSIDE the
+ * test that already establishes the conditions it needs, which is exactly how
+ * the loopback-binding assertions come to ride in the first test.
  */
-before(async () => {
-  await requirePortIsFree();
-  await awaitStartupLog();
-  await confirmServerIsOurs();
-}, { timeout: startupHookTimeoutMs });
+const registerSuite = () => {
+  /**
+   * Bring the server up before any test runs, in three ordered steps whose order
+   * is itself part of the guarantee: prove the port is free, start the child and
+   * observe its readiness, then prove the process answering that port is the child.
+   *
+   * The hook carries an explicit deadline because Node leaves hook timeouts
+   * unbounded by default; it is generous enough that only a genuine stall inside
+   * the hook can trip it.
+   */
+  before(async () => {
+    await requirePortIsFree();
+    await awaitStartupLog();
+    await confirmServerIsOurs();
+  }, { timeout: startupHookTimeoutMs });
+
+  /**
+   * Shut the server down once every test has run - completely, and within a
+   * deadline it cannot exceed.
+   *
+   * Teardown is written as a bounded sequence of states rather than a single wait,
+   * because "wait for the child to exit" is exactly the step that can never be
+   * trusted to complete. Each stage has its own deadline and each outcome is
+   * checked:
+   *
+   *   1. Announce the shutdown. From here an exit is EXPECTED, so the death is not
+   *      reported as a mid-suite failure.
+   *   2. Skip the whole sequence if there is nothing to stop - the child was never
+   *      spawned, or it has already exited. Signalling a corpse is pointless noise.
+   *   3. Ask politely with SIGTERM, and check that the signal was actually
+   *      delivered instead of assuming it.
+   *   4. Wait a bounded grace period for the exit; escalate to SIGKILL if the
+   *      child ignores it, again checking delivery.
+   *   5. Wait a second bounded period. If the child is STILL there, stop waiting
+   *      and fail - a pending wait here would hang `npm test` with no result at
+   *      all, and would leave port 3000 occupied for whatever runs next.
+   *   6. Let the output drain briefly so the final diagnostics are complete.
+   *
+   * Anything that went wrong is collected and reported together, including a kill
+   * the runtime could not deliver: a shutdown error that is swallowed is precisely
+   * how an orphaned process survives the run. Whatever the outcome, every timer is
+   * cleared and every listener detached before the hook returns, and the hook
+   * itself carries an explicit deadline because Node leaves hook timeouts
+   * unbounded by default.
+   */
+  after(async () => {
+    teardownRequested = true;
+
+    const problems = [];
+
+    try {
+      if (!childWasSpawned() || childHasExited()) {
+        return;
+      }
+
+      if (!serverProcess.kill('SIGTERM') && !childHasExited()) {
+        problems.push('SIGTERM could not be delivered to the child process');
+      }
+
+      if (!(await settledWithin(exitObserved.promise, gracefulStopTimeoutMs))) {
+        if (!serverProcess.kill('SIGKILL') && !childHasExited()) {
+          problems.push('SIGKILL could not be delivered to the child process');
+        }
+
+        // Step 5 - terminal deadline. Reporting beats waiting forever. The state
+        // is re-read before reporting, so an exit that lands right on the deadline
+        // is treated as the success it is rather than as a phantom failure.
+        if (!(await settledWithin(exitObserved.promise, forcedStopTimeoutMs)) && !childHasExited()) {
+          problems.push(
+            `the child was still running ${gracefulStopTimeoutMs + forcedStopTimeoutMs} ms ` +
+            'after SIGTERM and SIGKILL, so it is probably still holding port 3000'
+          );
+        }
+      }
+
+      // Step 6 - give the pipes a bounded moment to finish, purely so that any
+      // diagnostics printed on the way out are complete.
+      if (!childStdioClosed) {
+        await settledWithin(stdioClosed.promise, stdioDrainTimeoutMs);
+      }
+
+      if (teardownError !== null) {
+        problems.push(
+          `the runtime reported "${redactMessage(teardownError.message)}" while stopping the child`
+        );
+      }
+    } finally {
+      // No timer of ours survives this hook: `settledWithin` clears its own, and
+      // the startup timers were cleared when startup settled. What remains are the
+      // listeners and the pipes, and both are released here.
+      releaseChildResources();
+    }
+
+    if (problems.length > 0) {
+      throw createHarnessError(
+        'The server process could not be shut down cleanly:\n' +
+        `${problems.map((problem) => `  - ${problem}`).join('\n')}\n${describeChild()}`
+      );
+    }
+  }, { timeout: teardownHookTimeoutMs });
+
+  /**
+   * Test 1 - the root greeting, asserted byte for byte, from a socket bound to
+   * loopback and to nothing else.
+   *
+   * `GET /` answers 200 with Content-Type `text/plain; charset=utf-8` and a body
+   * of exactly `Hello, World!\n` - 14 bytes, trailing newline included. That
+   * newline is part of the published contract rather than cosmetic, and terminal
+   * output hides it, so the byte length is asserted explicitly alongside the
+   * literal. The literal is authoritative: it is deliberately not relaxed to a
+   * looser paraphrase such as 'Hello world'.
+   *
+   * The binding half of this test proves a contract no request can prove on its
+   * own. `server.js` passes a `host` of 127.0.0.1 to `app.listen`, so the socket
+   * accepts connections from this host and from no other interface. Losing that
+   * argument is not a hypothetical regression - an earlier revision of this
+   * project did exactly that and served the tutorial on its container's routable
+   * address while its own startup log and README still promised loopback - and
+   * every request-based assertion in this suite stays green through it, because
+   * 127.0.0.1 answers whether the socket is bound to 127.0.0.1, to 0.0.0.0 or to
+   * `::`. So the binding is settled by the inverse claim instead: the addresses
+   * `addressesOutsideTheBinding` reports must all REFUSE the port.
+   *
+   * The two halves belong in one test because the order is load-bearing and the
+   * first half is what makes the second half mean anything. A server that has
+   * died refuses every address, so refusals prove nothing until the socket is
+   * known to be up and serving - and the greeting assertions above are precisely
+   * that proof, made by a request `get` has already bracketed with liveness
+   * checks on the child. Splitting them would either duplicate that request or
+   * leave the refusals resting on an unchecked assumption; keeping them together
+   * also holds the suite to the four results its contract fixes.
+   *
+   * One environmental caveat the failure message cannot state: a foreign process
+   * bound to one of this host's non-loopback addresses on this same port would be
+   * reported here too. The pre-flight in `before` rules that out for loopback but
+   * cannot for every interface, so this test fails in the safe direction - it
+   * reports a socket reachable where it should not be and leaves the operator to
+   * see which process owns it.
+   */
+  test('GET / returns the greeting byte for byte from a loopback-only socket', async () => {
+    const response = await get('/');
+
+    assert.equal(response.status, 200, 'the root route must answer 200 OK');
+
+    // Strict equality against the FULL header value. `res.type('text/plain')`
+    // sets that type verbatim - an argument containing a slash is passed straight
+    // through - and it is `res.send`, sending a string, that appends the charset to
+    // whatever Content-Type is already set. So the header on the wire carries the
+    // charset and a bare 'text/plain' comparison would fail against entirely
+    // correct behaviour. Pinning the whole value also catches a regression to
+    // Express's `text/html` default if `res.type` were ever dropped.
+    assert.equal(
+      response.headers.get('content-type'),
+      expectedContentType,
+      'the root route must serve plain text, not Express\'s text/html default'
+    );
+
+    assert.equal(response.body, 'Hello, World!\n', 'the greeting must be preserved verbatim');
+    assert.equal(Buffer.byteLength(response.body), 14, 'the greeting must remain 14 bytes');
+
+    // Everything above is the positive control the refusals below depend on: the
+    // server is answering this exact request on 127.0.0.1 right now.
+    const outside = addressesOutsideTheBinding();
+
+    // An empty list would walk the loop below zero times and report a green
+    // without probing anything, so the target list is asserted rather than
+    // assumed.
+    assert.notEqual(
+      outside.length,
+      0,
+      'there must be at least one address outside the binding to probe'
+    );
+
+    for (const address of outside) {
+      const { accepted, detail } = await probePortAt(address);
+
+      assert.equal(
+        accepted,
+        false,
+        `port ${serverPort} must not accept connections at ${address}: ${loopbackHost} is ` +
+        `answering, so accepting there too means the listening socket is bound to a wildcard ` +
+        `address (0.0.0.0 or ::) rather than to ${loopbackHost} alone - ${detail}`
+      );
+    }
+  });
+
+  /**
+   * Test 2 - the evening greeting, asserted WITHOUT a trailing newline.
+   *
+   * `GET /evening` answers 200 with Content-Type `text/plain; charset=utf-8` and a
+   * body of exactly `Good evening` - 12 bytes, no terminator. The asymmetry with
+   * test 1 is the whole reason both tests exist: the root greeting ends in a
+   * newline and this one does not, so the absence is asserted explicitly rather
+   * than left to the strict body comparison alone.
+   */
+  test('GET /evening returns the evening greeting with no trailing newline', async () => {
+    const response = await get('/evening');
+
+    assert.equal(response.status, 200, 'the evening route must answer 200 OK');
+
+    assert.equal(
+      response.headers.get('content-type'),
+      expectedContentType,
+      'the evening route must serve plain text'
+    );
+
+    assert.equal(response.body, 'Good evening', 'the evening greeting must be exact');
+    assert.equal(Buffer.byteLength(response.body), 12, 'the evening greeting must remain 12 bytes');
+    assert.equal(
+      response.body.endsWith('\n'),
+      false,
+      'the evening greeting must NOT gain a trailing newline'
+    );
+  });
+
+  /**
+   * Test 3 - the framework must not advertise itself.
+   *
+   * Express enables an `X-Powered-By` response header by default, and `server.js`
+   * disables that setting application-wide, so neither route sends it. This test
+   * is what keeps it that way.
+   *
+   * Both routes are checked, because the header is written per response from an
+   * application-wide setting rather than per route: if the setting were ever
+   * re-enabled, every response would regain the header at once.
+   */
+  test('neither endpoint advertises the framework via x-powered-by', async () => {
+    const root = await get('/');
+    const evening = await get('/evening');
+
+    // `Headers.get` yields null for a header that was never sent, which is
+    // exactly the condition being asserted.
+    assert.equal(
+      root.headers.get('x-powered-by'),
+      null,
+      'the root route must not send an x-powered-by header'
+    );
+
+    assert.equal(
+      evening.headers.get('x-powered-by'),
+      null,
+      'the evening route must not send an x-powered-by header'
+    );
+  });
+
+  /**
+   * Test 4 - anything unrouted falls through to the default 404.
+   *
+   * Mechanises the documented manual step `curl http://127.0.0.1:3000/nonexistent`.
+   *
+   * The server registers no middleware at all, so route declaration order is the
+   * entire routing contract and any unmatched path reaches Express's built-in
+   * final handler. Only the status is asserted: the body and content type of
+   * that handler are framework internals, and pinning them would make this test
+   * fail on an Express upgrade that changed nothing the project actually
+   * promises.
+   *
+   * `fetch` resolves rather than throws on a 404, so the response is inspected
+   * normally.
+   */
+  test('GET /nonexistent falls through to the default 404 handler', async () => {
+    const response = await get('/nonexistent');
+
+    assert.equal(response.status, 404, 'an unregistered path must answer 404');
+  });
+};
 
 /**
- * Shut the server down once every test has run - completely, and within a
- * deadline it cannot exceed.
+ * The environment variable the front end sets on the child runner it starts, so
+ * that the child knows it is the suite and not another front end.
  *
- * Teardown is written as a bounded sequence of states rather than a single wait,
- * because "wait for the child to exit" is exactly the step that can never be
- * trusted to complete. Each stage has its own deadline and each outcome is
- * checked:
- *
- *   1. Announce the shutdown. From here an exit is EXPECTED, so the death is not
- *      reported as a mid-suite failure.
- *   2. Skip the whole sequence if there is nothing to stop - the child was never
- *      spawned, or it has already exited. Signalling a corpse is pointless noise.
- *   3. Ask politely with SIGTERM, and check that the signal was actually
- *      delivered instead of assuming it.
- *   4. Wait a bounded grace period for the exit; escalate to SIGKILL if the
- *      child ignores it, again checking delivery.
- *   5. Wait a second bounded period. If the child is STILL there, stop waiting
- *      and fail - a pending wait here would hang `npm test` with no result at
- *      all, and would leave port 3000 occupied for whatever runs next.
- *   6. Let the output drain briefly so the final diagnostics are complete.
- *
- * Anything that went wrong is collected and reported together, including a kill
- * the runtime could not deliver: a shutdown error that is swallowed is precisely
- * how an orphaned process survives the run. Whatever the outcome, every timer is
- * cleared and every listener detached before the hook returns, and the hook
- * itself carries an explicit deadline because Node leaves hook timeouts
- * unbounded by default.
+ * Two independent signals answer that question and the belt and braces is the
+ * point. `NODE_TEST_CONTEXT` is set by Node itself in every file the test runner
+ * loads, and this variable is set by the front end for the runner it starts.
+ * Either one is enough to register the suite, so the front-end branch is reached
+ * only when NEITHER is present - which is exactly the case when a person, or the
+ * `npm test` script, runs this file. A file that mistook itself for a front end
+ * while already running under the runner would start a runner of its own, and
+ * that runner another, without end; requiring both signals to be absent is what
+ * makes that impossible rather than merely unlikely.
  */
-after(async () => {
-  teardownRequested = true;
+const childRoleVariable = 'HELLO_WORLD_SUITE_CHILD';
 
-  const problems = [];
+/**
+ * The line that opens a stack block in the runner's TAP report, e.g. `stack: |-`.
+ *
+ * Stack frames arrive in two shapes and `stackFramePattern` only recognises one
+ * of them. A frame printed by V8 keeps its `at ` prefix, but the runner strips
+ * that prefix from the frames it puts in a TAP `stack` field, leaving lines that
+ * are indented under the key and carry no other marker. Recognising the key is
+ * therefore the only way to know that what follows is a stack: the captured
+ * indentation records how far the key itself sits in, and the block runs until a
+ * line returns to that indentation or further left.
+ */
+const tapStackKeyPattern = /^(\s*)stack:\s*\|-?\s*$/;
 
-  try {
-    if (!childWasSpawned() || childHasExited()) {
+/**
+ * A transform that rewrites the child runner's report as it streams past: every
+ * line has its filesystem locations redacted, runs of stack frames are replaced
+ * by a count of what was dropped, and everything else is passed through exactly
+ * as the runner wrote it.
+ *
+ * Rewriting the runner's own output is the only place this can be done. The
+ * `location` and `stack` a failure carries are synthesised by the runner from the
+ * test's registration site and the error's stack, so no assertion message this
+ * suite writes - however carefully redacted - can reach them. The filter sits
+ * outside the runner and therefore sees all of it.
+ *
+ * It deliberately makes no assumption about which reporter produced the text.
+ * A pipe is not a terminal, so the child selects TAP and the report keeps the
+ * `# tests`, `# pass` and `# fail` summary the README quotes; but a report in
+ * another format still passes through with its frames collapsed and its paths
+ * labelled, because both rules are recognised per line rather than per format.
+ *
+ * @returns {Transform} a filter to pipe one of the child's output streams through
+ */
+const createRedactingStream = () => {
+  // A chunk boundary can fall inside a multi-byte character, and decoding each
+  // chunk on its own would corrupt that character. The decoder holds an
+  // incomplete tail back until the rest of it arrives.
+  const decoder = new StringDecoder('utf8');
+
+  // Whatever followed the last newline of the previous chunk. A line can only be
+  // rewritten once it is complete, so the remainder waits here for its
+  // terminator.
+  let carry = '';
+
+  // Indentation of the TAP `stack` key currently being consumed, or null when the
+  // filter is not inside a stack block.
+  let stackBlockIndent = null;
+
+  // How many frames the run being summarised has dropped, and the indentation to
+  // print that summary at. The indentation is taken from the first frame dropped
+  // so the summary lines up with the frames it replaces, whichever reporter laid
+  // them out.
+  let framesDropped = 0;
+  let frameIndent = null;
+
+  const indentationOf = (line) => line.length - line.trimStart().length;
+
+  /**
+   * Close off a run of dropped frames by reporting how many there were. Saying
+   * how many keeps the shape of the failure visible - and tells the reader that
+   * running the suite under `node --test` directly is where the frames still are.
+   *
+   * @param {string[]} emit - lines to be written for the current chunk
+   */
+  const summariseDroppedFrames = (emit) => {
+    if (framesDropped > 0) {
+      const indent = frameIndent === null
+        ? ' '.repeat(stackBlockIndent === null ? 4 : stackBlockIndent + 2)
+        : frameIndent;
+
+      emit.push(`${indent}<${framesDropped} stack frame${framesDropped === 1 ? '' : 's'} omitted>`);
+      framesDropped = 0;
+      frameIndent = null;
+    }
+  };
+
+  /**
+   * Decide what one complete line of the runner's report becomes.
+   *
+   * @param {string} line - a single line, without its terminator
+   * @param {string[]} emit - lines to be written for the current chunk
+   */
+  const consumeLine = (line, emit) => {
+    if (stackBlockIndent !== null) {
+      // A blank line belongs to the block scalar rather than ending it, but it is
+      // not a frame either, so it is consumed without inflating the count.
+      if (line.trim() === '') {
+        return;
+      }
+
+      // Inside a TAP stack block, every line indented past the key is a frame.
+      // The block ends at the first line back at the key's own indentation or
+      // left of it - `...`, which closes the YAML document, is such a line.
+      if (indentationOf(line) > stackBlockIndent) {
+        framesDropped += 1;
+
+        if (frameIndent === null) {
+          frameIndent = line.slice(0, indentationOf(line));
+        }
+
+        return;
+      }
+
+      summariseDroppedFrames(emit);
+      stackBlockIndent = null;
+    }
+
+    const opensStackBlock = tapStackKeyPattern.exec(line);
+
+    if (opensStackBlock !== null) {
+      // The key itself is kept, so the report still says a stack was there; only
+      // its body is replaced.
+      emit.push(redactPaths(line));
+      stackBlockIndent = opensStackBlock[1].length;
+
       return;
     }
 
-    if (!serverProcess.kill('SIGTERM') && !childHasExited()) {
-      problems.push('SIGTERM could not be delivered to the child process');
-    }
+    // A frame that kept its `at ` prefix: written by a reporter that formats
+    // errors itself, or by the runtime reporting an uncaught error on stderr.
+    if (stackFramePattern.test(line)) {
+      framesDropped += 1;
 
-    if (!(await settledWithin(exitObserved.promise, gracefulStopTimeoutMs))) {
-      if (!serverProcess.kill('SIGKILL') && !childHasExited()) {
-        problems.push('SIGKILL could not be delivered to the child process');
+      if (frameIndent === null) {
+        frameIndent = line.slice(0, indentationOf(line));
       }
 
-      // Step 5 - terminal deadline. Reporting beats waiting forever. The state
-      // is re-read before reporting, so an exit that lands right on the deadline
-      // is treated as the success it is rather than as a phantom failure.
-      if (!(await settledWithin(exitObserved.promise, forcedStopTimeoutMs)) && !childHasExited()) {
-        problems.push(
-          `the child was still running ${gracefulStopTimeoutMs + forcedStopTimeoutMs} ms ` +
-          'after SIGTERM and SIGKILL, so it is probably still holding port 3000'
-        );
+      return;
+    }
+
+    summariseDroppedFrames(emit);
+    emit.push(redactPaths(line));
+  };
+
+  /**
+   * Join the rewritten lines back into a chunk. Every line is terminated, which
+   * also terminates a final line that arrived without a newline of its own.
+   *
+   * @param {string[]} emit - lines to be written for the current chunk
+   * @returns {string} the chunk to push downstream
+   */
+  const render = (emit) => (emit.length === 0 ? '' : `${emit.join('\n')}\n`);
+
+  return new Transform({
+    transform(chunk, _encoding, done) {
+      const emit = [];
+
+      carry += decoder.write(chunk);
+
+      const lines = carry.split('\n');
+
+      // The last element is whatever followed the final newline: an empty string,
+      // or an incomplete line. Either way it waits for the next chunk.
+      carry = lines.pop();
+      lines.forEach((line) => consumeLine(line, emit));
+
+      done(null, render(emit));
+    },
+
+    flush(done) {
+      const emit = [];
+
+      carry += decoder.end();
+
+      if (carry !== '') {
+        consumeLine(carry, emit);
+        carry = '';
+      }
+
+      // A stack block that ran to the end of the output still owes its summary.
+      summariseDroppedFrames(emit);
+
+      done(null, render(emit));
+    }
+  });
+};
+
+/**
+ * Run the suite in a child `node --test` process and copy that runner's report
+ * out through the filter above. This is the front-end role described in the file
+ * header, and it is what `npm test` invokes.
+ *
+ * The runner's verdict is passed through untouched. Redaction decides how a
+ * failure READS; it never decides whether the run failed, and a report that
+ * exposed the checkout layout would be no more actionable for having done so.
+ */
+const runSuiteWithRedactedDiagnostics = () => {
+  // `process.execPath` rather than the string 'node', so the tests run on the
+  // same interpreter as this front end instead of whichever node happens to come
+  // first on PATH. Arguments given to this process are forwarded ahead of the
+  // file, so `npm test -- --test-name-pattern=evening` still reaches the runner.
+  // The suite is named as a file and never as the `tests/` directory: a directory
+  // is part of the Node 20 runner's contract but is read as a glob pattern from
+  // Node 22 onwards, where it matches nothing and would report a green run of
+  // zero tests.
+  //
+  // `detached` puts the runner at the head of its own process group, which is
+  // what makes the whole tree stoppable below: the group grows to include the
+  // test file the runner loads and the server that file spawns, so one signal
+  // reaches all three. The handle is deliberately NOT unref'd - this process
+  // still waits for the runner to finish and report.
+  const runner = spawn(
+    process.execPath,
+    ['--test', ...process.argv.slice(2), __filename],
+    {
+      cwd: repoRoot,
+      detached: true,
+      // No stdin: the runner never reads any, and a process in a background
+      // group that tried to read the terminal would be stopped by SIGTTIN rather
+      // than fail. Both output streams are piped, because both are filtered.
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, [childRoleVariable]: '1' }
+    }
+  );
+
+  // Piping, rather than writing on every 'data' event, keeps backpressure
+  // intact: a slow destination pauses the child's output instead of letting it
+  // accumulate here without a bound.
+  runner.stdout.pipe(createRedactingStream()).pipe(process.stdout);
+  runner.stderr.pipe(createRedactingStream()).pipe(process.stderr);
+
+  /**
+   * Pass a signal on to the runner and to everything the runner started.
+   *
+   * Stopping `npm test` has to stop the whole tree. Signalling the runner alone
+   * is not enough: the runner cancels its run and kills the test file without
+   * giving it the chance to complete its teardown, and the server that file
+   * spawned is then orphaned - still holding port 3000 for whatever runs next,
+   * which is the one failure mode this suite works hardest to avoid. Signalling
+   * the process GROUP the detached runner leads reaches the runner, the test file
+   * and the server together, so an interrupted run leaves the port free.
+   *
+   * @param {NodeJS.Signals} signal - the signal this process received
+   */
+  const stopRunner = (signal) => {
+    // Nothing to signal if the spawn never produced a process, or if the runner
+    // has already gone.
+    if (runner.pid === undefined || runner.exitCode !== null || runner.signalCode !== null) {
+      return;
+    }
+
+    try {
+      // A negative pid addresses the process group led by that pid.
+      process.kill(-runner.pid, signal);
+    } catch (error) {
+      // ESRCH means the group has already gone, which is the outcome asked for.
+      // Anything else - a platform without process groups, most plausibly - still
+      // deserves the single-process attempt rather than silence.
+      if (error.code !== 'ESRCH') {
+        runner.kill(signal);
       }
     }
+  };
 
-    // Step 6 - give the pipes a bounded moment to finish, purely so that any
-    // diagnostics printed on the way out are complete.
-    if (!childStdioClosed) {
-      await settledWithin(stdioClosed.promise, stdioDrainTimeoutMs);
+  const forwarders = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((signal) => {
+    const forward = () => stopRunner(signal);
+
+    process.on(signal, forward);
+
+    return { signal, forward };
+  });
+
+  // A spawn that never produced a process has no exit status to pass on, so the
+  // failure is reported here instead - redacted, because the message names the
+  // interpreter it could not run.
+  runner.once('error', (error) => {
+    process.stderr.write(`Could not start the test runner: ${redactMessage(error.message)}\n`);
+    process.exitCode = 1;
+  });
+
+  runner.once('close', (code, signal) => {
+    // Nothing of ours outlives the run: a signal listener left attached would
+    // keep this process handling signals it can no longer act on.
+    forwarders.forEach(({ signal: name, forward }) => process.off(name, forward));
+
+    if (signal !== null) {
+      process.stderr.write(`The test runner was stopped by ${signal} before it could report.\n`);
+      process.exitCode = 1;
+
+      return;
     }
 
-    if (teardownError !== null) {
-      problems.push(
-        `the runtime reported "${redactMessage(teardownError.message)}" while stopping the child`
-      );
-    }
-  } finally {
-    // No timer of ours survives this hook: `settledWithin` clears its own, and
-    // the startup timers were cleared when startup settled. What remains are the
-    // listeners and the pipes, and both are released here.
-    releaseChildResources();
-  }
-
-  if (problems.length > 0) {
-    throw createHarnessError(
-      'The server process could not be shut down cleanly:\n' +
-      `${problems.map((problem) => `  - ${problem}`).join('\n')}\n${describeChild()}`
-    );
-  }
-}, { timeout: teardownHookTimeoutMs });
+    process.exitCode = code;
+  });
+};
 
 /**
- * Test 1 - the root greeting, asserted byte for byte.
- *
- * `GET /` answers 200 with Content-Type `text/plain; charset=utf-8` and a body
- * of exactly `Hello, World!\n` - 14 bytes, trailing newline included. That
- * newline is part of the published contract rather than cosmetic, and terminal
- * output hides it, so the byte length is asserted explicitly alongside the
- * literal. The literal is authoritative: it is deliberately not relaxed to a
- * looser paraphrase such as 'Hello world'.
+ * Role dispatch - the one decision that separates the two roles described in the
+ * file header. Under the test runner this file is the suite; run on its own it is
+ * the front end that starts the runner and redacts what comes back.
  */
-test('GET / returns the greeting byte for byte', async () => {
-  const response = await get('/');
+if (process.env.NODE_TEST_CONTEXT === undefined && process.env[childRoleVariable] === undefined) {
+  runSuiteWithRedactedDiagnostics();
+} else {
+  registerSuite();
+}
 
-  assert.equal(response.status, 200, 'the root route must answer 200 OK');
-
-  // Strict equality against the FULL header value. `res.type('text/plain')`
-  // sets that type verbatim - an argument containing a slash is passed straight
-  // through - and it is `res.send`, sending a string, that appends the charset to
-  // whatever Content-Type is already set. So the header on the wire carries the
-  // charset and a bare 'text/plain' comparison would fail against entirely
-  // correct behaviour. Pinning the whole value also catches a regression to
-  // Express's `text/html` default if `res.type` were ever dropped.
-  assert.equal(
-    response.headers.get('content-type'),
-    expectedContentType,
-    'the root route must serve plain text, not Express\'s text/html default'
-  );
-
-  assert.equal(response.body, 'Hello, World!\n', 'the greeting must be preserved verbatim');
-  assert.equal(Buffer.byteLength(response.body), 14, 'the greeting must remain 14 bytes');
-});
-
-/**
- * Test 2 - the evening greeting, asserted WITHOUT a trailing newline.
- *
- * `GET /evening` answers 200 with Content-Type `text/plain; charset=utf-8` and a
- * body of exactly `Good evening` - 12 bytes, no terminator. The asymmetry with
- * test 1 is the whole reason both tests exist: the root greeting ends in a
- * newline and this one does not, so the absence is asserted explicitly rather
- * than left to the strict body comparison alone.
- */
-test('GET /evening returns the evening greeting with no trailing newline', async () => {
-  const response = await get('/evening');
-
-  assert.equal(response.status, 200, 'the evening route must answer 200 OK');
-
-  assert.equal(
-    response.headers.get('content-type'),
-    expectedContentType,
-    'the evening route must serve plain text'
-  );
-
-  assert.equal(response.body, 'Good evening', 'the evening greeting must be exact');
-  assert.equal(Buffer.byteLength(response.body), 12, 'the evening greeting must remain 12 bytes');
-  assert.equal(
-    response.body.endsWith('\n'),
-    false,
-    'the evening greeting must NOT gain a trailing newline'
-  );
-});
-
-/**
- * Test 3 - the framework must not advertise itself.
- *
- * Express enables an `X-Powered-By` response header by default, and `server.js`
- * disables that setting application-wide, so neither route sends it. This test
- * is what keeps it that way.
- *
- * Both routes are checked, because the header is written per response from an
- * application-wide setting rather than per route: if the setting were ever
- * re-enabled, every response would regain the header at once.
- */
-test('neither endpoint advertises the framework via x-powered-by', async () => {
-  const root = await get('/');
-  const evening = await get('/evening');
-
-  // `Headers.get` yields null for a header that was never sent, which is
-  // exactly the condition being asserted.
-  assert.equal(
-    root.headers.get('x-powered-by'),
-    null,
-    'the root route must not send an x-powered-by header'
-  );
-
-  assert.equal(
-    evening.headers.get('x-powered-by'),
-    null,
-    'the evening route must not send an x-powered-by header'
-  );
-});
-
-/**
- * Test 4 - anything unrouted falls through to the default 404.
- *
- * Mechanises the documented manual step `curl http://127.0.0.1:3000/nonexistent`.
- *
- * The server registers no middleware at all, so route declaration order is the
- * entire routing contract and any unmatched path reaches Express's built-in
- * final handler. Only the status is asserted: the body and content type of
- * that handler are framework internals, and pinning them would make this test
- * fail on an Express upgrade that changed nothing the project actually
- * promises.
- *
- * `fetch` resolves rather than throws on a 404, so the response is inspected
- * normally.
- */
-test('GET /nonexistent falls through to the default 404 handler', async () => {
-  const response = await get('/nonexistent');
-
-  assert.equal(response.status, 404, 'an unregistered path must answer 404');
-});
-
-/**
- * Test 5 - the listening socket is bound to loopback and to nothing else.
- *
- * `server.js` passes a `host` of 127.0.0.1 to `app.listen`, so the socket accepts
- * connections from this host and from no other interface. Losing that argument is
- * not a hypothetical regression - an earlier revision of this project did exactly
- * that, and served the tutorial on its container's routable address while its own
- * startup log and README still promised loopback. Tests 1 to 4 would stay green
- * through it, which is why this one asserts the negative instead: the addresses
- * `addressesOutsideTheBinding` reports must refuse the port.
- *
- * The order is as load-bearing as the assertion. A server that has died refuses
- * every address, so the refusals mean nothing until the socket is known to be up
- * and serving - hence the positive control first, through `get`, which also
- * brackets that request with liveness checks on the child.
- *
- * One environmental caveat the failure message cannot state: a foreign process
- * bound to one of this host's non-loopback addresses on this same port would be
- * reported here too. The pre-flight in `before` rules that out for loopback but
- * cannot for every interface, so this test fails in the safe direction - it
- * reports a socket reachable where it should not be and leaves the operator to
- * see which process owns it.
- */
-test('the listening socket is bound to loopback only', async () => {
-  const serving = await get('/');
-
-  assert.equal(
-    serving.status,
-    200,
-    `the server must be answering on ${baseUrl} for the refusals below to prove anything`
-  );
-
-  const outside = addressesOutsideTheBinding();
-
-  // An empty list would walk the loop below zero times and report a green
-  // without probing anything, so the target list is asserted rather than
-  // assumed.
-  assert.notEqual(
-    outside.length,
-    0,
-    'there must be at least one address outside the binding to probe'
-  );
-
-  for (const address of outside) {
-    const { accepted, detail } = await probePortAt(address);
-
-    assert.equal(
-      accepted,
-      false,
-      `port ${serverPort} must not accept connections at ${address}: ${loopbackHost} is ` +
-      `answering, so accepting there too means the listening socket is bound to a wildcard ` +
-      `address (0.0.0.0 or ::) rather than to ${loopbackHost} alone - ${detail}`
-    );
-  }
-});
