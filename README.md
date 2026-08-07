@@ -8,8 +8,8 @@ This project demonstrates a basic HTTP server using Express.js with multiple end
 
 ## Prerequisites
 
-- Node.js (v18 or higher)
-- npm (Node Package Manager)
+- Node.js `^20.20.2 || >=22.12.0` (20.20.2 or later on the 20.x line, or 22.12.0 or later) - enforced by the `engines` field in `package.json` and pinned for version managers in `.nvmrc`
+- npm 10 or higher (`>=10.0.0`)
 
 ## Installation
 
