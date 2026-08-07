@@ -8,10 +8,12 @@ This project demonstrates a basic HTTP server using Express.js with multiple end
 
 ## Prerequisites
 
-- Node.js 20.20.2 or newer on the Node 20 line (`^20.20.2`) - declared in the `engines` field of `package.json`, and pinned for version managers by `.nvmrc`, which selects `20.20.2`
+- Node.js `^20.20.2 || >=22.12.0` - that is, 20.20.2 or newer on the Node 20 line, or 22.12.0 and anything newer (22, 24, 26) - declared in the `engines` field of `package.json`
 - npm 10 or higher (`>=10.0.0`) - declared in the same `engines` field
 
-`20.20.2` is the runtime this project is built and verified against, and it is the newest 20.x release. The range is written as `^20.20.2` - that is, 20.20.2 up to but not including 21.0.0 - rather than as an open `>=` bound, because `npm test` finds its suite by naming the `tests/` directory, and treating a positional argument as a directory to search is part of the Node 20 test runner's contract. Node 22 changed the same argument to mean a glob pattern, so `node --test tests/` does not locate the suite there. Bounding the range to the line the test command actually works on keeps the manifest from advertising support this project cannot honour.
+`.nvmrc` selects `20.20.2`, which is the runtime this project was built and verified against. Be aware that **the Node 20 line reached end-of-life on 30 April 2026 and receives no further security patches**; the lines still supported upstream are 22 (maintenance LTS), 24 (active LTS) and 26 (current). The declared range therefore accepts every supported line as well as 20.20.2, so nothing here holds you on 20 - if you have a choice, run 22.12.0 or newer, and change `.nvmrc` to match if you pin with a version manager. The suite is verified on 20.20.2 and 22.23.2.
+
+Both bounds are lower bounds and the range deliberately admits newer majors, which it can do because `npm test` names its suite file outright (`node --test tests/server.test.js`). An earlier version of this project named the `tests/` directory instead. Passing a directory is part of the Node 20 test runner's contract, but Node 22 reads the same argument as a glob pattern and finds nothing there, so that command worked on one line only - and the range had been narrowed to the Node 20 line to match it, which pinned the project to a runtime that is now out of support. Naming the file works identically on every supported line, so the runtime no longer has to be narrowed to keep `npm test` working.
 
 npm checks `engines` on every install: a runtime outside the declared range is reported as an `npm warn EBADENGINE` line naming both the required and the current version, and the install is refused outright when `engine-strict` is enabled. This project ships no `.npmrc`, so an unsupported runtime warns rather than blocks.
 
@@ -50,14 +52,17 @@ Run the endpoint verification suite:
 npm test
 ```
 
-This runs `node --test tests/`, which uses Node's built-in test runner: no additional test dependencies are installed or needed, and the project declares no `devDependencies`. Naming the `tests/` directory lets the runner discover the suite inside it, which is the single file `tests/server.test.js`; adding another `*.test.js` file to that directory is enough to include it, with no change to the command. It launches `server.js` as a child process, waits for the startup line shown above, then exercises the running server over real HTTP and checks that:
+This runs `node --test tests/server.test.js`, which uses Node's built-in test runner: no additional test dependencies are installed or needed, and the project declares no `devDependencies`. The command names the suite file rather than the `tests/` directory, because a positional directory argument is read as a glob pattern from Node 22 onwards and finds nothing; naming the file behaves the same on every supported line. A second suite file would be named alongside it. The run launches `server.js` as a child process, waits for the startup line shown above, then exercises the running server over real HTTP and checks that:
 
 - `GET /` answers 200 with `text/plain; charset=utf-8` and a body of exactly 14 bytes
 - `GET /evening` answers 200 with `text/plain; charset=utf-8` and a body of exactly 12 bytes, with no trailing newline
 - neither response carries an `X-Powered-By` header
 - an unregistered path answers 404
+- the listening socket is bound to loopback only: while `127.0.0.1:3000` is answering, a connection to this host's own non-loopback address on the same port is refused
 
-Port 3000 must be free before you run the suite, because the server binds that port directly; a process already holding it makes the run fail with an explanatory message instead of hanging. A complete run reports `# pass 4` and `# fail 0` - one result per check above - and `npm test` exits non-zero if any of those contracts drifts.
+That last check is the one a request to `127.0.0.1` cannot make, since loopback answers whether the socket is bound to `127.0.0.1` or to every interface, so it dials the addresses outside the binding and requires each to refuse.
+
+Port 3000 must be free before you run the suite, because the server binds that port directly; a process already holding it makes the run fail with an explanatory message instead of hanging. A complete run reports `# pass 5` and `# fail 0` - one result per check above - and `npm test` exits non-zero if any of those contracts drifts.
 
 ## API Endpoints
 

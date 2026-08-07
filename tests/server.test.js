@@ -16,16 +16,26 @@
  * mirror-image reason: a suite that cannot stop its own server leaves the port
  * occupied for whatever runs next.
  *
+ * One published contract cannot be proven by a request at all. The server must
+ * bind the loopback address and nothing else, and a request to 127.0.0.1
+ * succeeds identically whether the socket is bound to 127.0.0.1, to 0.0.0.0 or
+ * to `::`. That contract is settled instead by dialling the addresses OUTSIDE
+ * the intended binding and requiring every one of them to refuse.
+ *
  * @requires node:test - Node's built-in test runner
  * @requires node:assert/strict - strict assertions, so any drift fails loudly
  * @requires node:child_process - to spawn the real server process
  * @requires node:path - to resolve server.js independently of the cwd
+ * @requires node:net - to ask at the TCP layer which addresses accept a connection
+ * @requires node:os - to enumerate this host's addresses outside the binding
  */
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
+const net = require('node:net');
+const os = require('node:os');
 
 /**
  * Base URL for every request. The server hardcodes host 127.0.0.1 and port
@@ -33,6 +43,16 @@ const path = require('node:path');
  * must target that exact address rather than making it configurable.
  */
 const baseUrl = 'http://127.0.0.1:3000';
+
+/**
+ * The host and port `baseUrl` already names, parsed out of it once, because the
+ * loopback-binding check works at the TCP layer and needs the port as a number.
+ * Parsing keeps one source of truth: a second literal 3000 could drift away from
+ * the URL every request in this suite uses.
+ */
+const serverOrigin = new URL(baseUrl);
+const loopbackHost = serverOrigin.hostname;
+const serverPort = Number(serverOrigin.port);
 
 /**
  * Repository root, one level above this file. It anchors both the entrypoint
@@ -93,6 +113,15 @@ const requestTimeoutMs = 5000;
  * different transport error is treated conservatively as unavailable.
  */
 const preflightTimeoutMs = 2000;
+
+/**
+ * Upper bound on a single loopback-binding probe - see `probePortAt`. A local
+ * address settles a connection attempt almost immediately, either by accepting
+ * it or by refusing it, so this is a deadlock guard rather than a tuning knob:
+ * an address that does neither within the window is reported as inconclusive
+ * instead of being silently counted as a refusal.
+ */
+const bindingProbeTimeoutMs = 2000;
 
 /**
  * How long to let the child's stdout and stderr finish arriving after the child
@@ -285,6 +314,13 @@ const resetChildState = () => {
  * so a child that refused both signals would otherwise stop the runner from ever
  * exiting, replacing the loud teardown failure raised just above with a silent
  * hang.
+ *
+ * Those three releases must therefore happen on EVERY path that got as far as a
+ * child handle - including the one where the spawn came back without usable
+ * pipes and startup failed immediately. That is why the child-level handlers are
+ * published as soon as they are attached rather than at the end of a successful
+ * setup: this function is reached with whatever was installed at the time, and
+ * it detaches exactly that.
  */
 const releaseChildResources = () => {
   if (serverProcess === null || installedListeners === null) {
@@ -296,9 +332,16 @@ const releaseChildResources = () => {
   serverProcess.removeListener('close', installedListeners.close);
   serverProcess.unref();
 
+  // A pipe is destroyed on the evidence that it exists, but a listener is
+  // detached only on the evidence that it was attached: the stdio handlers are
+  // published as they are installed, and a child that came back without usable
+  // pipes never gets that far. Handing `undefined` to `removeListener` would
+  // throw and abandon the rest of this cleanup.
   if (serverProcess.stdout !== null && serverProcess.stdout !== undefined) {
-    serverProcess.stdout.removeListener('data', installedListeners.stdoutData);
-    serverProcess.stdout.removeListener('data', installedListeners.stdoutReady);
+    if (installedListeners.stdoutData !== undefined) {
+      serverProcess.stdout.removeListener('data', installedListeners.stdoutData);
+      serverProcess.stdout.removeListener('data', installedListeners.stdoutReady);
+    }
 
     if (!childStdioClosed) {
       serverProcess.stdout.destroy();
@@ -306,7 +349,9 @@ const releaseChildResources = () => {
   }
 
   if (serverProcess.stderr !== null && serverProcess.stderr !== undefined) {
-    serverProcess.stderr.removeListener('data', installedListeners.stderrData);
+    if (installedListeners.stderrData !== undefined) {
+      serverProcess.stderr.removeListener('data', installedListeners.stderrData);
+    }
 
     if (!childStdioClosed) {
       serverProcess.stderr.destroy();
@@ -704,7 +749,10 @@ const probeFixedPort = async () => {
       return { free: true, detail: 'the connection was refused, so nothing is listening' };
     }
 
-    const reason = error instanceof Error ? error.message : String(error);
+    // Redacted like every other runtime message this suite quotes: `detail` is
+    // interpolated into the operator-visible refusal in `requirePortIsFree`, and
+    // a transport error is free to name a filesystem path or a proxy URL.
+    const reason = redactMessage(error instanceof Error ? error.message : String(error));
 
     return { free: false, detail: `probing it failed with ${reason} (cause ${code})` };
   } finally {
@@ -743,6 +791,109 @@ const requirePortIsFree = async () => {
     );
   }
 };
+
+/**
+ * Every local address that is NOT the loopback address the server binds.
+ *
+ * These addresses are what make a binding assertion possible at all. A request
+ * to 127.0.0.1 is answered whether the listening socket is bound to 127.0.0.1,
+ * to 0.0.0.0 or to `::`, so no amount of loopback traffic can distinguish a
+ * correctly bound socket from one exposed on every interface. Only an address
+ * outside the intended binding separates them: a loopback-bound socket refuses
+ * it, a wildcard-bound socket answers on it.
+ *
+ * Non-internal IPv4 addresses are the primary targets - this host's own
+ * addresses, which is exactly the negative check the project documents. IPv6 is
+ * deliberately left out: the non-internal IPv6 addresses a host typically has
+ * are link-local, which cannot be dialled without a zone index, so including
+ * them would add failures that say nothing about the binding.
+ *
+ * A host with no non-loopback interface at all - an isolated network namespace,
+ * for instance - would leave nothing to probe and make the check vacuous, so
+ * `127.0.0.2` stands in for that case. The whole of 127.0.0.0/8 reaches the
+ * loopback interface, so a wildcard-bound socket answers there too while a
+ * socket bound to 127.0.0.1 alone does not.
+ *
+ * @returns {string[]} addresses to probe - never empty
+ */
+const addressesOutsideTheBinding = () => {
+  const found = [];
+
+  for (const entries of Object.values(os.networkInterfaces())) {
+    if (entries === undefined) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (entry.family === 'IPv4' && entry.internal === false) {
+        found.push(entry.address);
+      }
+    }
+  }
+
+  return found.length > 0 ? found : ['127.0.0.2'];
+};
+
+/**
+ * Ask, at the TCP layer, whether anything accepts a connection to the fixed port
+ * at `address`.
+ *
+ * A connection attempt is the right instrument and an HTTP request is not: the
+ * question is which addresses the listening socket occupies, and the handshake
+ * alone settles it. Nothing is written, and the socket is destroyed the moment
+ * the verdict is in, so an address that does turn out to be answering is never
+ * sent a request.
+ *
+ * Only a completed handshake counts as accepted. Every other outcome - a
+ * refusal, an unreachable address, an expired deadline - is reported with the
+ * detail that produced it, so the assertion can say what was actually observed
+ * rather than that something unspecified went wrong.
+ *
+ * @param {string} address - the local address to dial
+ * @returns {Promise<{accepted: boolean, detail: string}>}
+ */
+const probePortAt = (address) => new Promise((resolve) => {
+  const socket = net.createConnection({ host: address, port: serverPort });
+  let settled = false;
+  let timer = null;
+
+  /**
+   * The single settlement point, for the same reason the startup phase has one:
+   * connect, error and the deadline can all fire, and only the first of them
+   * decides. Destroying the socket here is what stops a probe holding a handle
+   * open past its verdict.
+   */
+  const settle = (outcome) => {
+    if (settled) {
+      return;
+    }
+
+    settled = true;
+    clearTimeout(timer);
+    socket.destroy();
+    resolve(outcome);
+  };
+
+  timer = setTimeout(() => settle({
+    accepted: false,
+    detail: `the connection neither completed nor failed within ${bindingProbeTimeoutMs} ms`
+  }), bindingProbeTimeoutMs);
+
+  socket.once('connect', () => settle({
+    accepted: true,
+    detail: 'the connection was accepted'
+  }));
+
+  // `code` is the actionable half of a transport error (ECONNREFUSED and the
+  // like); the message is only worth quoting when there is no code, and then
+  // only redacted, as everywhere else in this suite.
+  socket.once('error', (error) => settle({
+    accepted: false,
+    detail: error.code === undefined
+      ? `the connection failed: ${redactMessage(error.message)}`
+      : `the connection failed with ${error.code}`
+  }));
+});
 
 /**
  * Prove that the process answering port 3000 is the child this suite started.
@@ -951,6 +1102,17 @@ const awaitStartupLog = () => new Promise((resolve, reject) => {
   serverProcess.on('exit', onExit);
   serverProcess.on('close', onClose);
 
+  // Publish them immediately, before anything below can fail. Teardown detaches
+  // precisely the listeners named in this record and calls `unref` on the child,
+  // and it does nothing at all while the record is empty - so a startup that
+  // fails at the pipe check just below would otherwise leave these three
+  // attached and the child handle holding the runner's event loop open.
+  installedListeners = {
+    error: onError,
+    exit: onExit,
+    close: onClose
+  };
+
   // Node leaves the pipes null or undefined when a child could not be spawned
   // successfully, so they are checked rather than assumed. Without stdout there
   // is no readiness signal to wait for, which makes the run unwinnable - fail it
@@ -984,16 +1146,12 @@ const awaitStartupLog = () => new Promise((resolve, reject) => {
   serverProcess.stderr.setEncoding('utf8');
   serverProcess.stderr.on('data', appendStderr);
 
-  // Publish the handler references so teardown can detach precisely these
-  // listeners - and only these - once the run is over.
-  installedListeners = {
-    error: onError,
-    exit: onExit,
-    close: onClose,
-    stdoutData: appendStdout,
-    stdoutReady: watchForReadyLog,
-    stderrData: appendStderr
-  };
+  // Complete the record now that the stdio handlers are attached too, so
+  // teardown detaches precisely these listeners - and only these - once the run
+  // is over.
+  installedListeners.stdoutData = appendStdout;
+  installedListeners.stdoutReady = watchForReadyLog;
+  installedListeners.stderrData = appendStderr;
 });
 
 /**
@@ -1111,11 +1269,13 @@ test('GET / returns the greeting byte for byte', async () => {
 
   assert.equal(response.status, 200, 'the root route must answer 200 OK');
 
-  // Strict equality against the FULL header value. Express appends the charset
-  // to `res.type('text/plain')`, so a bare 'text/plain' comparison would fail
-  // against entirely correct behaviour. Pinning the whole value also catches a
-  // regression to Express's `text/html` default if `res.type` were ever
-  // dropped.
+  // Strict equality against the FULL header value. `res.type('text/plain')`
+  // sets that type verbatim - an argument containing a slash is passed straight
+  // through - and it is `res.send`, sending a string, that appends the charset to
+  // whatever Content-Type is already set. So the header on the wire carries the
+  // charset and a bare 'text/plain' comparison would fail against entirely
+  // correct behaviour. Pinning the whole value also catches a regression to
+  // Express's `text/html` default if `res.type` were ever dropped.
   assert.equal(
     response.headers.get('content-type'),
     expectedContentType,
@@ -1204,4 +1364,60 @@ test('GET /nonexistent falls through to the default 404 handler', async () => {
   const response = await get('/nonexistent');
 
   assert.equal(response.status, 404, 'an unregistered path must answer 404');
+});
+
+/**
+ * Test 5 - the listening socket is bound to loopback and to nothing else.
+ *
+ * `server.js` passes a `host` of 127.0.0.1 to `app.listen`, so the socket accepts
+ * connections from this host and from no other interface. Losing that argument is
+ * not a hypothetical regression - an earlier revision of this project did exactly
+ * that, and served the tutorial on its container's routable address while its own
+ * startup log and README still promised loopback. Tests 1 to 4 would stay green
+ * through it, which is why this one asserts the negative instead: the addresses
+ * `addressesOutsideTheBinding` reports must refuse the port.
+ *
+ * The order is as load-bearing as the assertion. A server that has died refuses
+ * every address, so the refusals mean nothing until the socket is known to be up
+ * and serving - hence the positive control first, through `get`, which also
+ * brackets that request with liveness checks on the child.
+ *
+ * One environmental caveat the failure message cannot state: a foreign process
+ * bound to one of this host's non-loopback addresses on this same port would be
+ * reported here too. The pre-flight in `before` rules that out for loopback but
+ * cannot for every interface, so this test fails in the safe direction - it
+ * reports a socket reachable where it should not be and leaves the operator to
+ * see which process owns it.
+ */
+test('the listening socket is bound to loopback only', async () => {
+  const serving = await get('/');
+
+  assert.equal(
+    serving.status,
+    200,
+    `the server must be answering on ${baseUrl} for the refusals below to prove anything`
+  );
+
+  const outside = addressesOutsideTheBinding();
+
+  // An empty list would walk the loop below zero times and report a green
+  // without probing anything, so the target list is asserted rather than
+  // assumed.
+  assert.notEqual(
+    outside.length,
+    0,
+    'there must be at least one address outside the binding to probe'
+  );
+
+  for (const address of outside) {
+    const { accepted, detail } = await probePortAt(address);
+
+    assert.equal(
+      accepted,
+      false,
+      `port ${serverPort} must not accept connections at ${address}: ${loopbackHost} is ` +
+      `answering, so accepting there too means the listening socket is bound to a wildcard ` +
+      `address (0.0.0.0 or ::) rather than to ${loopbackHost} alone - ${detail}`
+    );
+  }
 });
