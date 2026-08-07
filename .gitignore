@@ -1,0 +1,15 @@
+# Dependencies (installed with `npm ci`; never committed)
+node_modules/
+
+# npm diagnostic output
+npm-debug.log*
+.npm/
+
+# Local environment overrides
+.env
+.env.local
+.env.*.local
+
+# OS artifacts
+.DS_Store
+Thumbs.db
