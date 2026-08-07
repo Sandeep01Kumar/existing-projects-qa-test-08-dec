@@ -1,0 +1,12 @@
+# Dependencies: reconstructed from package-lock.json by `npm ci`, never committed.
+node_modules/
+
+# npm diagnostic output: written only when an npm command fails.
+npm-debug.log*
+
+# Local environment overrides. Nothing in this project reads environment
+# variables, so this is purely a standing guard against committing secrets.
+.env
+
+# macOS directory metadata.
+.DS_Store
